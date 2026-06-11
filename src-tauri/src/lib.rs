@@ -4,14 +4,39 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
 use walkdir::WalkDir;
 
+#[cfg(windows)]
+use windows::core::PCWSTR;
+#[cfg(windows)]
+use windows::Win32::Foundation::CloseHandle;
+#[cfg(windows)]
+use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard};
+#[cfg(windows)]
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
+#[cfg(windows)]
+use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+#[cfg(windows)]
+use windows::Win32::UI::Shell::{
+    IsUserAnAdmin, SHEmptyRecycleBinW, ShellExecuteW, SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI,
+    SHERB_NOSOUND,
+};
+#[cfg(windows)]
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
 #[cfg(not(windows))]
 compile_error!("DCleaner only supports Windows targets.");
+
+#[cfg(windows)]
+#[link(name = "dnsapi")]
+unsafe extern "system" {
+    fn DnsFlushResolverCache() -> i32;
+}
 
 #[derive(Default)]
 struct AppState {
@@ -71,6 +96,11 @@ enum CleanAction {
     FlushDns,
     ClearClipboard,
     ClearRecycleBin(Vec<PathBuf>),
+    CompactDatabases(Vec<PathBuf>),
+    BrowserJson {
+        path: PathBuf,
+        kind: BrowserJsonKind,
+    },
     BrowserSql {
         db_path: PathBuf,
         kind: BrowserDbKind,
@@ -87,9 +117,19 @@ enum BrowserDbKind {
     ChromiumCookies,
     ChromiumHistory,
     ChromiumDownloads,
+    ChromiumAutofill,
+    ChromiumPasswords,
     FirefoxCookies,
     FirefoxHistory,
     FirefoxDownloads,
+    FirefoxFormHistory,
+}
+
+#[derive(Clone)]
+enum BrowserJsonKind {
+    ChromiumLastDownloadLocation,
+    ChromiumSitePreferences,
+    FirefoxPasswords,
 }
 
 #[derive(Deserialize)]
@@ -391,20 +431,10 @@ fn restore_backup(path: String) -> Result<RestoreResult, String> {
         return Err("备份文件不存在或格式不正确".to_string());
     }
 
-    let output = Command::new("reg")
-        .arg("import")
-        .arg(&path)
-        .output()
-        .map_err(|error| error.to_string())?;
-
-    if output.status.success() {
-        Ok(RestoreResult {
-            success: true,
-            message: "注册表备份已导入。".to_string(),
-        })
-    } else {
-        Err(command_error("reg import", &output))
-    }
+    shell_execute("open", &path.display().to_string(), None).map(|_| RestoreResult {
+        success: true,
+        message: "已交给 Windows 注册表编辑器导入，请按系统提示确认。".to_string(),
+    })
 }
 
 #[tauri::command]
@@ -414,24 +444,9 @@ fn relaunch_as_admin(app: tauri::AppHandle) -> Result<(), String> {
     }
 
     let exe = std::env::current_exe().map_err(|error| error.to_string())?;
-    let escaped = exe.display().to_string().replace('\'', "''");
-    let output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &format!("Start-Process -FilePath '{}' -Verb RunAs", escaped),
-        ])
-        .output()
-        .map_err(|error| error.to_string())?;
-
-    if output.status.success() {
-        app.exit(0);
-        Ok(())
-    } else {
-        Err(command_error("Start-Process -Verb RunAs", &output))
-    }
+    shell_execute("runas", &exe.display().to_string(), None)?;
+    app.exit(0);
+    Ok(())
 }
 
 fn push_item(
@@ -586,6 +601,11 @@ fn scan_system_items(
         CleanAction::ClearClipboard,
     );
 
+    scan_explorer_history_items(items, counter);
+    scan_explorer_cache_items(items, counter);
+    scan_system_extra_items(items, counter);
+    scan_advanced_windows_items(items, counter);
+
     let dump_paths = collect_existing_files(vec![
         windows.join("MEMORY.DMP"),
         windows.join("Minidump"),
@@ -648,7 +668,7 @@ fn scan_system_items(
             ModuleKind::System,
             "DNS 缓存",
             "DNS 解析缓存",
-            "ipconfig /flushdns".to_string(),
+            "Win32 DNS Resolver Cache API".to_string(),
             "刷新本机 DNS 解析缓存。",
             0,
             RiskLevel::Safe,
@@ -683,11 +703,371 @@ fn scan_system_items(
 }
 
 #[cfg(windows)]
+fn scan_explorer_history_items(items: &mut Vec<ScannedItem>, counter: &mut usize) {
+    let registry_targets = [
+        (
+            "Explorer 地址栏输入记录",
+            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\TypedPaths",
+            "清理文件资源管理器地址栏中手动输入过的路径。",
+        ),
+        (
+            "Explorer 搜索框记录",
+            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\WordWheelQuery",
+            "清理文件资源管理器右上角搜索框的历史记录。",
+        ),
+        (
+            "运行对话框输入记录",
+            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RunMRU",
+            "清理 Win+R 运行框的输入历史。",
+        ),
+        (
+            "最近打开文档记录",
+            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RecentDocs",
+            "清理 Explorer 维护的最近文档 MRU 记录。",
+        ),
+        (
+            "打开/保存对话框历史",
+            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\ComDlg32\\OpenSavePidlMRU",
+            "清理系统打开/保存文件对话框中的历史位置记录。",
+        ),
+        (
+            "最近访问文件夹记录",
+            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\ComDlg32\\LastVisitedPidlMRU",
+            "清理系统打开/保存文件对话框最近访问的文件夹记录。",
+        ),
+    ];
+
+    for (name, key_path, detail) in registry_targets {
+        if registry_key_has_content(key_path) {
+            push_item(
+                items,
+                counter,
+                make_item(
+                    ModuleKind::System,
+                    "Explorer 历史记录",
+                    name,
+                    key_path.to_string(),
+                    detail,
+                    0,
+                    RiskLevel::Safe,
+                    false,
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                CleanAction::RegistryDelete {
+                    key_path: key_path.to_string(),
+                    value_name: None,
+                    delete_key: true,
+                },
+            );
+        }
+    }
+
+    if let Some(appdata) = env_path("APPDATA") {
+        let recent_dirs = existing_dirs(vec![
+            appdata.join("Microsoft").join("Windows").join("Recent"),
+            appdata
+                .join("Microsoft")
+                .join("Windows")
+                .join("Recent")
+                .join("AutomaticDestinations"),
+            appdata
+                .join("Microsoft")
+                .join("Windows")
+                .join("Recent")
+                .join("CustomDestinations"),
+        ]);
+        if !recent_dirs.is_empty() {
+            let (size, children) = dirs_size_preview(&recent_dirs, 180);
+            push_item(
+                items,
+                counter,
+                make_item(
+                    ModuleKind::System,
+                    "Explorer 历史记录",
+                    "快速访问与跳转列表历史",
+                    join_paths(&recent_dirs),
+                    "清理快速访问、最近项目与任务栏跳转列表缓存。",
+                    size,
+                    RiskLevel::Medium,
+                    false,
+                    Vec::new(),
+                    children,
+                ),
+                CleanAction::DeleteDirectoryContents(recent_dirs),
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+fn scan_explorer_cache_items(items: &mut Vec<ScannedItem>, counter: &mut usize) {
+    let local = env_path("LOCALAPPDATA").unwrap_or_default();
+    let explorer_dir = local.join("Microsoft").join("Windows").join("Explorer");
+    let thumbnails = collect_files_matching(vec![explorer_dir], |path| {
+        path.file_name()
+            .and_then(OsStr::to_str)
+            .map(|name| {
+                let lower = name.to_ascii_lowercase();
+                lower.starts_with("thumbcache_") || lower.starts_with("iconcache_")
+            })
+            .unwrap_or(false)
+    });
+    if !thumbnails.files.is_empty() {
+        push_item(
+            items,
+            counter,
+            make_item(
+                ModuleKind::System,
+                "Windows Explorer",
+                "缩略图与图标缓存",
+                join_paths(&thumbnails.files),
+                "清理 Explorer 生成的图片、视频缩略图和图标缓存数据库。",
+                thumbnails.size,
+                RiskLevel::Safe,
+                false,
+                Vec::new(),
+                thumbnails.preview,
+            ),
+            CleanAction::DeletePaths(thumbnails.files),
+        );
+    }
+}
+
+#[cfg(windows)]
+fn scan_system_extra_items(items: &mut Vec<ScannedItem>, counter: &mut usize) {
+    let windows = windows_dir();
+    let program_data = env_path("PROGRAMDATA").unwrap_or_default();
+    let local = env_path("LOCALAPPDATA").unwrap_or_default();
+
+    let wer_dirs = existing_dirs(vec![
+        program_data
+            .join("Microsoft")
+            .join("Windows")
+            .join("WER")
+            .join("ReportArchive"),
+        program_data
+            .join("Microsoft")
+            .join("Windows")
+            .join("WER")
+            .join("ReportQueue"),
+        program_data
+            .join("Microsoft")
+            .join("Windows")
+            .join("WER")
+            .join("Temp"),
+        local
+            .join("Microsoft")
+            .join("Windows")
+            .join("WER")
+            .join("ReportArchive"),
+        local
+            .join("Microsoft")
+            .join("Windows")
+            .join("WER")
+            .join("ReportQueue"),
+    ]);
+    if !wer_dirs.is_empty() {
+        let (size, children) = dirs_size_preview(&wer_dirs, 160);
+        push_item(
+            items,
+            counter,
+            make_item(
+                ModuleKind::System,
+                "系统",
+                "Windows 错误报告",
+                join_paths(&wer_dirs),
+                "清理 Windows Error Reporting 收集的崩溃报告与上传队列。",
+                size,
+                RiskLevel::Safe,
+                false,
+                Vec::new(),
+                children,
+            ),
+            CleanAction::DeleteDirectoryContents(wer_dirs),
+        );
+    }
+
+    let font_cache = collect_files_matching(
+        vec![
+            windows.join("System32").join("FNTCACHE.DAT"),
+            windows
+                .join("ServiceProfiles")
+                .join("LocalService")
+                .join("AppData")
+                .join("Local")
+                .join("FontCache"),
+            local.join("FontCache"),
+        ],
+        |path| {
+            path.file_name()
+                .and_then(OsStr::to_str)
+                .map(|name| {
+                    let lower = name.to_ascii_lowercase();
+                    lower == "fntcache.dat"
+                        || (lower.starts_with("fontcache") && lower.ends_with(".dat"))
+                })
+                .unwrap_or(false)
+        },
+    );
+    if !font_cache.files.is_empty() {
+        push_item(
+            items,
+            counter,
+            make_item(
+                ModuleKind::System,
+                "系统",
+                "字体缓存",
+                join_paths(&font_cache.files),
+                "清理字体预览和字体枚举缓存，系统会自动重建。",
+                font_cache.size,
+                RiskLevel::Medium,
+                false,
+                Vec::new(),
+                font_cache.preview,
+            ),
+            CleanAction::DeletePaths(font_cache.files),
+        );
+    }
+
+    let chkdsk_paths = chkdsk_fragment_paths();
+    if !chkdsk_paths.is_empty() {
+        let size = chkdsk_paths.iter().map(|path| path_size(path)).sum::<u64>();
+        let preview = chkdsk_paths
+            .iter()
+            .take(120)
+            .map(|path| FilePreview {
+                path: path.display().to_string(),
+                size_bytes: path_size(path),
+            })
+            .collect::<Vec<_>>();
+        push_item(
+            items,
+            counter,
+            make_item(
+                ModuleKind::System,
+                "系统",
+                "Chkdsk 文件碎片",
+                join_paths(&chkdsk_paths),
+                "清理磁盘检查留下的 FOUND.* 和 .chk 文件碎片。",
+                size,
+                RiskLevel::Medium,
+                false,
+                Vec::new(),
+                preview,
+            ),
+            CleanAction::DeletePaths(chkdsk_paths),
+        );
+    }
+
+    let iis_dirs = existing_dirs(vec![PathBuf::from(
+        std::env::var("SystemDrive")
+            .map(|drive| format!("{}\\inetpub\\logs\\LogFiles", drive))
+            .unwrap_or_else(|_| r"C:\inetpub\logs\LogFiles".to_string()),
+    )]);
+    if !iis_dirs.is_empty() {
+        let (size, children) = dirs_size_preview(&iis_dirs, 160);
+        push_item(
+            items,
+            counter,
+            make_item(
+                ModuleKind::System,
+                "高级",
+                "IIS 日志文件",
+                join_paths(&iis_dirs),
+                "清理本机 IIS 服务产生的网站访问日志。",
+                size,
+                RiskLevel::Medium,
+                false,
+                Vec::new(),
+                children,
+            ),
+            CleanAction::DeleteDirectoryContents(iis_dirs),
+        );
+    }
+}
+
+#[cfg(windows)]
+fn scan_advanced_windows_items(items: &mut Vec<ScannedItem>, counter: &mut usize) {
+    let key_targets = [
+        (
+            "菜单顺序缓存",
+            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\MenuOrder",
+            "清理开始菜单项目排序缓存。",
+            RiskLevel::Medium,
+        ),
+        (
+            "窗口大小和位置缓存",
+            "HKCU\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\Bags",
+            "清理 Explorer 记录的文件夹窗口大小、视图和位置。",
+            RiskLevel::Medium,
+        ),
+        (
+            "窗口大小和位置缓存",
+            "HKCU\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\BagMRU",
+            "清理 Explorer 记录的文件夹窗口大小、视图和位置。",
+            RiskLevel::Medium,
+        ),
+        (
+            "用户助手历史记录",
+            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\UserAssist",
+            "清理系统记录的程序运行频率历史。",
+            RiskLevel::High,
+        ),
+        (
+            "网络驱动器映射记录",
+            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Map Network Drive MRU",
+            "清理映射网络驱动器对话框中的历史记录。",
+            RiskLevel::Safe,
+        ),
+    ];
+
+    for (name, key_path, detail, risk) in key_targets {
+        if registry_key_has_content(key_path) {
+            push_registry_cleanup_item(
+                items,
+                counter,
+                ModuleKind::System,
+                "高级",
+                name,
+                key_path,
+                None,
+                true,
+                detail,
+                risk,
+                false,
+            );
+        }
+    }
+
+    let tray_key =
+        "HKCU\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\TrayNotify";
+    for value in ["IconStreams", "PastIconsStream"] {
+        if registry_value_exists(tray_key, value) {
+            push_registry_cleanup_item(
+                items,
+                counter,
+                ModuleKind::System,
+                "高级",
+                "托盘通知缓存",
+                tray_key,
+                Some(value.to_string()),
+                false,
+                "清理任务栏通知区域图标显示历史。",
+                RiskLevel::Medium,
+                false,
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
 fn scan_browser_items(
     items: &mut Vec<ScannedItem>,
     counter: &mut usize,
     _warnings: &mut Vec<String>,
 ) {
+    let appdata = env_path("APPDATA").unwrap_or_default();
     if let Some(local) = env_path("LOCALAPPDATA") {
         add_chromium_browser(
             items,
@@ -720,8 +1100,29 @@ fn scan_browser_items(
                 .join("User Data"),
             vec!["brave.exe"],
         );
+        add_chromium_browser(
+            items,
+            counter,
+            "Vivaldi",
+            local.join("Vivaldi").join("User Data"),
+            vec!["vivaldi.exe"],
+        );
     }
 
+    add_chromium_browser(
+        items,
+        counter,
+        "Opera",
+        appdata.join("Opera Software").join("Opera Stable"),
+        vec!["opera.exe"],
+    );
+    add_chromium_browser(
+        items,
+        counter,
+        "Opera GX",
+        appdata.join("Opera Software").join("Opera GX Stable"),
+        vec!["opera.exe"],
+    );
     add_firefox_browser(items, counter);
 }
 
@@ -737,6 +1138,7 @@ fn scan_application_items(
     add_application_dirs(
         items,
         counter,
+        "开发工具",
         "Visual Studio Code 缓存",
         vec![
             appdata.join("Code").join("Cache"),
@@ -753,6 +1155,7 @@ fn scan_application_items(
     add_application_dirs(
         items,
         counter,
+        "互联网与通信",
         "Slack 缓存",
         vec![
             appdata.join("Slack").join("Cache"),
@@ -768,6 +1171,7 @@ fn scan_application_items(
     add_application_dirs(
         items,
         counter,
+        "互联网与通信",
         "Discord 缓存",
         vec![
             appdata.join("discord").join("Cache"),
@@ -782,6 +1186,7 @@ fn scan_application_items(
     add_application_dirs(
         items,
         counter,
+        "互联网与通信",
         "Microsoft Teams 缓存",
         vec![
             appdata.join("Microsoft").join("Teams").join("Cache"),
@@ -796,6 +1201,7 @@ fn scan_application_items(
     add_application_dirs(
         items,
         counter,
+        "多媒体播放器",
         "VLC 媒体缓存",
         vec![appdata.join("vlc").join("art")],
         vec!["vlc.exe"],
@@ -806,12 +1212,96 @@ fn scan_application_items(
     add_application_dirs(
         items,
         counter,
+        "开发工具",
         "npm 缓存",
         vec![local.join("npm-cache")],
         Vec::new(),
         RiskLevel::Safe,
         true,
     );
+
+    add_application_dirs(
+        items,
+        counter,
+        "多媒体播放器",
+        "Spotify 缓存",
+        vec![local.join("Spotify").join("Data")],
+        vec!["Spotify.exe"],
+        RiskLevel::Safe,
+        false,
+    );
+
+    add_application_dirs(
+        items,
+        counter,
+        "开发工具",
+        "Sublime Text 缓存",
+        vec![
+            local.join("Sublime Text").join("Cache"),
+            appdata.join("Sublime Text").join("Cache"),
+        ],
+        vec!["sublime_text.exe"],
+        RiskLevel::Safe,
+        false,
+    );
+
+    add_application_dirs(
+        items,
+        counter,
+        "办公软件",
+        "Adobe Acrobat 缓存",
+        vec![
+            appdata
+                .join("Adobe")
+                .join("Acrobat")
+                .join("DC")
+                .join("Cache"),
+            local.join("Adobe").join("Acrobat").join("DC").join("Cache"),
+        ],
+        vec!["Acrobat.exe", "AcroRd32.exe"],
+        RiskLevel::Safe,
+        false,
+    );
+
+    add_application_dirs(
+        items,
+        counter,
+        "Windows 附件",
+        "Windows Defender 扫描日志",
+        vec![env_path("PROGRAMDATA")
+            .unwrap_or_default()
+            .join("Microsoft")
+            .join("Windows Defender")
+            .join("Scans")
+            .join("History")],
+        Vec::new(),
+        RiskLevel::Medium,
+        false,
+    );
+
+    let package_dirs = package_cache_dirs(&local);
+    if !package_dirs.is_empty() {
+        let (size, children) = dirs_size_preview(&package_dirs, 160);
+        push_item(
+            items,
+            counter,
+            make_item(
+                ModuleKind::Application,
+                "Windows 商店应用",
+                "Windows 商店应用缓存",
+                join_paths(&package_dirs),
+                "清理 UWP/商店应用的 LocalCache 与 TempState 缓存目录。",
+                size,
+                RiskLevel::Medium,
+                false,
+                Vec::new(),
+                children,
+            ),
+            CleanAction::DeleteDirectoryContents(package_dirs),
+        );
+    }
+
+    scan_application_registry_items(items, counter);
 
     if let Some(temp) = env_path("TEMP") {
         let archives = collect_files_matching(vec![temp], |path| {
@@ -842,6 +1332,94 @@ fn scan_application_items(
                     archives.preview,
                 ),
                 CleanAction::DeletePaths(archives.files),
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+fn package_cache_dirs(local: &Path) -> Vec<PathBuf> {
+    let packages = local.join("Packages");
+    if !packages.is_dir() {
+        return Vec::new();
+    }
+    let mut result = Vec::new();
+    for package in read_child_dirs(&packages) {
+        result.extend(existing_dirs(vec![
+            package.join("LocalCache"),
+            package.join("TempState"),
+            package.join("AC").join("Temp"),
+        ]));
+    }
+    result
+}
+
+#[cfg(windows)]
+fn scan_application_registry_items(items: &mut Vec<ScannedItem>, counter: &mut usize) {
+    let office_versions = ["16.0", "15.0", "14.0", "12.0"];
+    let office_apps = ["Word", "Excel", "PowerPoint", "Access", "Publisher"];
+    for version in office_versions {
+        for app_name in office_apps {
+            for mru in ["File MRU", "Place MRU"] {
+                let key_path = format!(
+                    "HKCU\\Software\\Microsoft\\Office\\{}\\{}\\{}",
+                    version, app_name, mru
+                );
+                if registry_key_has_content(&key_path) {
+                    push_registry_cleanup_item(
+                        items,
+                        counter,
+                        ModuleKind::Application,
+                        "办公软件",
+                        "Microsoft Office 最近打开列表",
+                        &key_path,
+                        None,
+                        true,
+                        "清理 Word/Excel/PowerPoint 等 Office 应用的最近文件与位置记录。",
+                        RiskLevel::Medium,
+                        false,
+                    );
+                }
+            }
+        }
+    }
+
+    let utility_targets = [
+        (
+            "7-Zip 历史记录",
+            "HKCU\\Software\\7-Zip\\Compression",
+            "清理 7-Zip 最近压缩/解压路径记录。",
+        ),
+        (
+            "WinRAR 历史记录",
+            "HKCU\\Software\\WinRAR\\DialogEditHistory",
+            "清理 WinRAR 对话框中的历史路径和输入记录。",
+        ),
+        (
+            "Windows Media Player 最近记录",
+            "HKCU\\Software\\Microsoft\\MediaPlayer\\Player\\RecentFileList",
+            "清理 Windows Media Player 最近播放列表。",
+        ),
+        (
+            "TeamViewer 连接记录",
+            "HKCU\\Software\\TeamViewer",
+            "清理 TeamViewer 保存在当前用户下的连接历史缓存。",
+        ),
+    ];
+    for (name, key_path, detail) in utility_targets {
+        if registry_key_has_content(key_path) {
+            push_registry_cleanup_item(
+                items,
+                counter,
+                ModuleKind::Application,
+                "常见软件 MRU",
+                name,
+                key_path,
+                None,
+                true,
+                detail,
+                RiskLevel::Medium,
+                false,
             );
         }
     }
@@ -945,13 +1523,57 @@ fn add_chromium_browser(
             );
         }
 
+        let preferences = profile.join("Preferences");
+        if preferences.exists() {
+            push_item(
+                items,
+                counter,
+                make_item(
+                    ModuleKind::Browser,
+                    browser_name,
+                    &format!("{} 最后下载位置 ({})", browser_name, profile_name),
+                    preferences.display().to_string(),
+                    "清理浏览器记录的上次下载保存路径。",
+                    file_size(&preferences),
+                    RiskLevel::Safe,
+                    false,
+                    processes.clone(),
+                    Vec::new(),
+                ),
+                CleanAction::BrowserJson {
+                    path: preferences.clone(),
+                    kind: BrowserJsonKind::ChromiumLastDownloadLocation,
+                },
+            );
+            push_item(
+                items,
+                counter,
+                make_item(
+                    ModuleKind::Browser,
+                    browser_name,
+                    &format!("{} 网站偏好设置 ({})", browser_name, profile_name),
+                    preferences.display().to_string(),
+                    "清理针对特定网站保存的权限、缩放和内容例外设置。",
+                    file_size(&preferences),
+                    RiskLevel::Medium,
+                    false,
+                    processes.clone(),
+                    Vec::new(),
+                ),
+                CleanAction::BrowserJson {
+                    path: preferences,
+                    kind: BrowserJsonKind::ChromiumSitePreferences,
+                },
+            );
+        }
+
         let cookies = [
             profile.join("Network").join("Cookies"),
             profile.join("Cookies"),
         ]
         .into_iter()
         .find(|path| path.exists());
-        if let Some(cookies) = cookies {
+        if let Some(cookies) = cookies.clone() {
             push_item(
                 items,
                 counter,
@@ -970,6 +1592,54 @@ fn add_chromium_browser(
                 CleanAction::BrowserSql {
                     db_path: cookies,
                     kind: BrowserDbKind::ChromiumCookies,
+                },
+            );
+        }
+
+        let web_data = profile.join("Web Data");
+        if web_data.exists() {
+            push_item(
+                items,
+                counter,
+                make_item(
+                    ModuleKind::Browser,
+                    browser_name,
+                    &format!("{} 保存的表单信息 ({})", browser_name, profile_name),
+                    web_data.display().to_string(),
+                    "清理自动填充保存的表单、地址和搜索输入记录。",
+                    file_size(&web_data),
+                    RiskLevel::Medium,
+                    false,
+                    processes.clone(),
+                    Vec::new(),
+                ),
+                CleanAction::BrowserSql {
+                    db_path: web_data.clone(),
+                    kind: BrowserDbKind::ChromiumAutofill,
+                },
+            );
+        }
+
+        let login_data = profile.join("Login Data");
+        if login_data.exists() {
+            push_item(
+                items,
+                counter,
+                make_item(
+                    ModuleKind::Browser,
+                    browser_name,
+                    &format!("{} 保存的密码 ({})", browser_name, profile_name),
+                    login_data.display().to_string(),
+                    "清理浏览器保存的登录账号密码记录。",
+                    file_size(&login_data),
+                    RiskLevel::High,
+                    false,
+                    processes.clone(),
+                    Vec::new(),
+                ),
+                CleanAction::BrowserSql {
+                    db_path: login_data.clone(),
+                    kind: BrowserDbKind::ChromiumPasswords,
                 },
             );
         }
@@ -997,6 +1667,39 @@ fn add_chromium_browser(
                     children,
                 ),
                 CleanAction::DeleteDirectoryContents(session_dirs),
+            );
+        }
+
+        let mut compact_dbs = vec![
+            profile.join("History"),
+            profile.join("Web Data"),
+            profile.join("Login Data"),
+            profile.join("Favicons"),
+            profile.join("Top Sites"),
+            profile.join("Network").join("Reporting and NEL"),
+        ];
+        if let Some(cookie_db) = cookies {
+            compact_dbs.push(cookie_db);
+        }
+        compact_dbs.retain(|path| path.exists());
+        if !compact_dbs.is_empty() {
+            let size = compact_dbs.iter().map(|path| file_size(path)).sum::<u64>();
+            push_item(
+                items,
+                counter,
+                make_item(
+                    ModuleKind::Browser,
+                    browser_name,
+                    &format!("{} 压缩数据库 ({})", browser_name, profile_name),
+                    join_paths(&compact_dbs),
+                    "对浏览器 SQLite 数据库执行 VACUUM，减少碎片，不删除用户数据。",
+                    size,
+                    RiskLevel::Safe,
+                    false,
+                    processes.clone(),
+                    Vec::new(),
+                ),
+                CleanAction::CompactDatabases(compact_dbs),
             );
         }
     }
@@ -1121,6 +1824,78 @@ fn add_firefox_browser(items: &mut Vec<ScannedItem>, counter: &mut usize) {
             );
         }
 
+        let formhistory = profile.join("formhistory.sqlite");
+        if formhistory.exists() {
+            push_item(
+                items,
+                counter,
+                make_item(
+                    ModuleKind::Browser,
+                    "Firefox",
+                    &format!("Firefox 保存的表单信息 ({})", profile_name),
+                    formhistory.display().to_string(),
+                    "清理 Firefox 自动填充保存的表单和搜索输入记录。",
+                    file_size(&formhistory),
+                    RiskLevel::Medium,
+                    false,
+                    processes.clone(),
+                    Vec::new(),
+                ),
+                CleanAction::BrowserSql {
+                    db_path: formhistory.clone(),
+                    kind: BrowserDbKind::FirefoxFormHistory,
+                },
+            );
+        }
+
+        let logins = profile.join("logins.json");
+        if logins.exists() {
+            push_item(
+                items,
+                counter,
+                make_item(
+                    ModuleKind::Browser,
+                    "Firefox",
+                    &format!("Firefox 保存的密码 ({})", profile_name),
+                    logins.display().to_string(),
+                    "清理 Firefox 保存的登录账号密码记录。",
+                    file_size(&logins),
+                    RiskLevel::High,
+                    false,
+                    processes.clone(),
+                    Vec::new(),
+                ),
+                CleanAction::BrowserJson {
+                    path: logins,
+                    kind: BrowserJsonKind::FirefoxPasswords,
+                },
+            );
+        }
+
+        let site_prefs = collect_existing_files(vec![
+            profile.join("permissions.sqlite"),
+            profile.join("content-prefs.sqlite"),
+        ]);
+        if !site_prefs.files.is_empty() {
+            push_item(
+                items,
+                counter,
+                make_item(
+                    ModuleKind::Browser,
+                    "Firefox",
+                    &format!("Firefox 网站偏好设置 ({})", profile_name),
+                    join_paths(&site_prefs.files),
+                    "清理网站权限、缩放和内容偏好数据库。",
+                    site_prefs.size,
+                    RiskLevel::Medium,
+                    false,
+                    processes.clone(),
+                    site_prefs.preview,
+                ),
+                CleanAction::DeletePaths(site_prefs.files),
+            );
+        }
+
         let session_dirs = existing_dirs(vec![profile.join("sessionstore-backups")]);
         let session_files = collect_existing_files(vec![
             profile.join("recovery.jsonlz4"),
@@ -1150,6 +1925,38 @@ fn add_firefox_browser(items: &mut Vec<ScannedItem>, counter: &mut usize) {
                 CleanAction::DeletePaths(paths),
             );
         }
+
+        let compact_dbs = [
+            profile.join("places.sqlite"),
+            profile.join("cookies.sqlite"),
+            profile.join("formhistory.sqlite"),
+            profile.join("permissions.sqlite"),
+            profile.join("content-prefs.sqlite"),
+            profile.join("favicons.sqlite"),
+        ]
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+        if !compact_dbs.is_empty() {
+            let size = compact_dbs.iter().map(|path| file_size(path)).sum::<u64>();
+            push_item(
+                items,
+                counter,
+                make_item(
+                    ModuleKind::Browser,
+                    "Firefox",
+                    &format!("Firefox 压缩数据库 ({})", profile_name),
+                    join_paths(&compact_dbs),
+                    "对 Firefox SQLite 数据库执行 VACUUM，减少碎片，不删除用户数据。",
+                    size,
+                    RiskLevel::Safe,
+                    false,
+                    processes.clone(),
+                    Vec::new(),
+                ),
+                CleanAction::CompactDatabases(compact_dbs),
+            );
+        }
     }
 }
 
@@ -1157,6 +1964,7 @@ fn add_firefox_browser(items: &mut Vec<ScannedItem>, counter: &mut usize) {
 fn add_application_dirs(
     items: &mut Vec<ScannedItem>,
     counter: &mut usize,
+    category: &str,
     name: &str,
     paths: Vec<PathBuf>,
     process_names: Vec<&str>,
@@ -1173,7 +1981,7 @@ fn add_application_dirs(
         counter,
         make_item(
             ModuleKind::Application,
-            "第三方应用",
+            category,
             name,
             join_paths(&dirs),
             "清理应用日志、缓存与历史生成文件。",
@@ -1213,6 +2021,21 @@ fn scan_registry_items(
     }
     if let Err(error) = scan_registry_file_extensions(items, counter) {
         warnings.push(format!("注册表文件扩展名扫描失败: {}", error));
+    }
+    if let Err(error) = scan_registry_com_classes(items, counter) {
+        warnings.push(format!("注册表 ActiveX/COM 扫描失败: {}", error));
+    }
+    if let Err(error) = scan_registry_type_libraries(items, counter) {
+        warnings.push(format!("注册表 TypeLib 扫描失败: {}", error));
+    }
+    if let Err(error) = scan_registry_mui_cache(items, counter) {
+        warnings.push(format!("注册表 MUI 缓存扫描失败: {}", error));
+    }
+    if let Err(error) = scan_registry_sound_events(items, counter) {
+        warnings.push(format!("注册表声音事件扫描失败: {}", error));
+    }
+    if let Err(error) = scan_registry_services(items, counter) {
+        warnings.push(format!("注册表 Windows 服务扫描失败: {}", error));
     }
 }
 
@@ -1535,14 +2358,225 @@ fn scan_registry_file_extensions(
 }
 
 #[cfg(windows)]
-fn add_registry_issue(
+fn scan_registry_com_classes(
     items: &mut Vec<ScannedItem>,
     counter: &mut usize,
+) -> Result<(), String> {
+    use winreg::enums::HKEY_CLASSES_ROOT;
+    use winreg::RegKey;
+
+    let hkcr = RegKey::predef(HKEY_CLASSES_ROOT);
+    let clsid = match hkcr.open_subkey("CLSID") {
+        Ok(value) => value,
+        Err(_) => return Ok(()),
+    };
+    for child in clsid.enum_keys().flatten() {
+        for server_key in ["InprocServer32", "LocalServer32"] {
+            let Ok(server) = clsid.open_subkey(format!("{}\\{}", child, server_key)) else {
+                continue;
+            };
+            let Ok(path) = server.get_value::<String, _>("") else {
+                continue;
+            };
+            if path.trim().is_empty() || !registry_command_path_missing(&path) {
+                continue;
+            }
+            add_registry_issue(
+                items,
+                counter,
+                "ActiveX 和类问题",
+                "删除指向不存在组件文件的 COM/ActiveX 类注册。",
+                &format!("HKCR\\CLSID\\{}", child),
+                None,
+                true,
+                RiskLevel::High,
+                false,
+            );
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn scan_registry_type_libraries(
+    items: &mut Vec<ScannedItem>,
+    counter: &mut usize,
+) -> Result<(), String> {
+    use winreg::enums::HKEY_CLASSES_ROOT;
+    use winreg::RegKey;
+
+    let hkcr = RegKey::predef(HKEY_CLASSES_ROOT);
+    let typelib = match hkcr.open_subkey("TypeLib") {
+        Ok(value) => value,
+        Err(_) => return Ok(()),
+    };
+    for guid in typelib.enum_keys().flatten() {
+        let Ok(guid_key) = typelib.open_subkey(&guid) else {
+            continue;
+        };
+        for version in guid_key.enum_keys().flatten() {
+            let version_path = format!("{}\\{}", guid, version);
+            let Ok(version_key) = guid_key.open_subkey(&version) else {
+                continue;
+            };
+            for platform in ["0\\win32", "0\\win64"] {
+                let Ok(platform_key) = version_key.open_subkey(platform) else {
+                    continue;
+                };
+                let Ok(path) = platform_key.get_value::<String, _>("") else {
+                    continue;
+                };
+                if path.trim().is_empty() || !registry_command_path_missing(&path) {
+                    continue;
+                }
+                add_registry_issue(
+                    items,
+                    counter,
+                    "类型库",
+                    "删除指向不存在程序库文件的 TypeLib 注册。",
+                    &format!("HKCR\\TypeLib\\{}", version_path),
+                    None,
+                    true,
+                    RiskLevel::High,
+                    false,
+                );
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn scan_registry_mui_cache(
+    items: &mut Vec<ScannedItem>,
+    counter: &mut usize,
+) -> Result<(), String> {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+
+    let key_path =
+        "Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\MuiCache";
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let key = match hkcu.open_subkey(key_path) {
+        Ok(value) => value,
+        Err(_) => return Ok(()),
+    };
+    let full_key = format!("HKCU\\{}", key_path);
+    for (value_name, _) in key.enum_values().flatten() {
+        if mui_cache_target_missing(&value_name) {
+            add_registry_issue(
+                items,
+                counter,
+                "MUI 缓存",
+                "删除指向不存在程序的多语言界面缓存记录。",
+                &full_key,
+                Some(value_name),
+                false,
+                RiskLevel::Safe,
+                false,
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn scan_registry_sound_events(
+    items: &mut Vec<ScannedItem>,
+    counter: &mut usize,
+) -> Result<(), String> {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let apps_path = "AppEvents\\Schemes\\Apps";
+    let apps = match hkcu.open_subkey(apps_path) {
+        Ok(value) => value,
+        Err(_) => return Ok(()),
+    };
+    for app in apps.enum_keys().flatten() {
+        let Ok(app_key) = apps.open_subkey(&app) else {
+            continue;
+        };
+        for event_name in app_key.enum_keys().flatten() {
+            let current_path = format!("{}\\{}\\{}\\.Current", apps_path, app, event_name);
+            let Ok(current_key) = hkcu.open_subkey(&current_path) else {
+                continue;
+            };
+            let Ok(sound_path) = current_key.get_value::<String, _>("") else {
+                continue;
+            };
+            if sound_path.trim().is_empty() {
+                continue;
+            }
+            let expanded = PathBuf::from(expand_env_vars(&sound_path));
+            if !registry_path_exists(&expanded) {
+                add_registry_issue(
+                    items,
+                    counter,
+                    "声音事件",
+                    "清理指向不存在声音文件的系统事件声音关联。",
+                    &format!("HKCU\\{}", current_path),
+                    Some(String::new()),
+                    false,
+                    RiskLevel::Medium,
+                    false,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn scan_registry_services(items: &mut Vec<ScannedItem>, counter: &mut usize) -> Result<(), String> {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::RegKey;
+
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let services_path = "SYSTEM\\CurrentControlSet\\Services";
+    let services = match hklm.open_subkey(services_path) {
+        Ok(value) => value,
+        Err(_) => return Ok(()),
+    };
+    for service in services.enum_keys().flatten() {
+        let Ok(service_key) = services.open_subkey(&service) else {
+            continue;
+        };
+        let Ok(image_path) = service_key.get_value::<String, _>("ImagePath") else {
+            continue;
+        };
+        if !registry_command_path_missing(&image_path) {
+            continue;
+        }
+        add_registry_issue(
+            items,
+            counter,
+            "Windows 服务",
+            "删除指向不存在可执行文件的后台服务注册。",
+            &format!("HKLM\\{}\\{}", services_path, service),
+            None,
+            true,
+            RiskLevel::High,
+            false,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn push_registry_cleanup_item(
+    items: &mut Vec<ScannedItem>,
+    counter: &mut usize,
+    module: ModuleKind,
+    category: &str,
     name: &str,
-    suggestion: &str,
     key_path: &str,
     value_name: Option<String>,
     delete_key: bool,
+    detail: &str,
     risk: RiskLevel,
     selected_by_default: bool,
 ) {
@@ -1554,11 +2588,11 @@ fn add_registry_issue(
         items,
         counter,
         make_item(
-            ModuleKind::Registry,
-            "注册表",
+            module,
+            category,
             name,
             target,
-            suggestion,
+            detail,
             0,
             risk,
             selected_by_default,
@@ -1573,6 +2607,33 @@ fn add_registry_issue(
     );
 }
 
+#[cfg(windows)]
+fn add_registry_issue(
+    items: &mut Vec<ScannedItem>,
+    counter: &mut usize,
+    name: &str,
+    suggestion: &str,
+    key_path: &str,
+    value_name: Option<String>,
+    delete_key: bool,
+    risk: RiskLevel,
+    selected_by_default: bool,
+) {
+    push_registry_cleanup_item(
+        items,
+        counter,
+        ModuleKind::Registry,
+        "注册表",
+        name,
+        key_path,
+        value_name,
+        delete_key,
+        suggestion,
+        risk,
+        selected_by_default,
+    );
+}
+
 fn execute_action(
     action: &CleanAction,
     cookie_whitelist: &[String],
@@ -1580,19 +2641,17 @@ fn execute_action(
     match action {
         CleanAction::DeleteDirectoryContents(dirs) => Ok(delete_directory_contents(dirs)),
         CleanAction::DeletePaths(paths) => Ok(delete_paths(paths)),
-        CleanAction::FlushDns => {
-            run_simple_command("ipconfig", &["/flushdns"]).map(|_| ActionOutcome {
-                freed_bytes: 0,
-                errors: Vec::new(),
-            })
-        }
-        CleanAction::ClearClipboard => {
-            run_simple_command("cmd", &["/C", "type nul | clip"]).map(|_| ActionOutcome {
-                freed_bytes: 0,
-                errors: Vec::new(),
-            })
-        }
+        CleanAction::FlushDns => flush_dns_cache().map(|_| ActionOutcome {
+            freed_bytes: 0,
+            errors: Vec::new(),
+        }),
+        CleanAction::ClearClipboard => clear_clipboard_api().map(|_| ActionOutcome {
+            freed_bytes: 0,
+            errors: Vec::new(),
+        }),
         CleanAction::ClearRecycleBin(roots) => clear_recycle_bin(roots),
+        CleanAction::CompactDatabases(paths) => compact_databases(paths),
+        CleanAction::BrowserJson { path, kind } => clean_browser_json(path, kind),
         CleanAction::BrowserSql { db_path, kind } => {
             clean_browser_database(db_path, kind, cookie_whitelist)
         }
@@ -1662,29 +2721,59 @@ fn remove_path(path: &Path) -> io::Result<()> {
 
 fn clear_recycle_bin(roots: &[PathBuf]) -> Result<ActionOutcome, String> {
     let before = roots.iter().map(|path| path_size(path)).sum::<u64>();
-    let output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            "Clear-RecycleBin -Force -ErrorAction SilentlyContinue",
-        ])
-        .output()
-        .map_err(|error| error.to_string())?;
-    if output.status.success() {
-        Ok(ActionOutcome {
+    let result = unsafe {
+        SHEmptyRecycleBinW(
+            None,
+            PCWSTR::null(),
+            SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND,
+        )
+    };
+    match result {
+        Ok(()) => Ok(ActionOutcome {
             freed_bytes: before,
             errors: Vec::new(),
-        })
-    } else {
-        let fallback = delete_directory_contents(roots);
-        if fallback.errors.is_empty() {
-            Ok(fallback)
-        } else {
-            Err(command_error("Clear-RecycleBin", &output))
+        }),
+        Err(error) => {
+            let fallback = delete_directory_contents(roots);
+            if fallback.errors.is_empty() {
+                Ok(fallback)
+            } else {
+                Err(format!("清空回收站失败: {}", error))
+            }
         }
     }
+}
+
+#[cfg(windows)]
+fn compact_databases(paths: &[PathBuf]) -> Result<ActionOutcome, String> {
+    use rusqlite::Connection;
+
+    let mut freed_bytes = 0u64;
+    let mut errors = Vec::new();
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        let before = file_size(path);
+        match Connection::open(path) {
+            Ok(conn) => {
+                if let Err(error) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;") {
+                    errors.push(format!("{}: {}", path.display(), error));
+                    continue;
+                }
+                drop(conn);
+                remove_sqlite_sidecars(path);
+                let after = file_size(path);
+                freed_bytes = freed_bytes.saturating_add(before.saturating_sub(after));
+            }
+            Err(error) => errors.push(format!("{}: {}", path.display(), error)),
+        }
+    }
+
+    Ok(ActionOutcome {
+        freed_bytes,
+        errors,
+    })
 }
 
 #[cfg(windows)]
@@ -1722,6 +2811,24 @@ fn clean_browser_database(
             execute_optional(&conn, "DELETE FROM downloads_slices")?;
             execute_optional(&conn, "DELETE FROM downloads")?;
         }
+        BrowserDbKind::ChromiumAutofill => {
+            execute_optional(&conn, "DELETE FROM autofill")?;
+            execute_optional(&conn, "DELETE FROM autofill_profiles")?;
+            execute_optional(&conn, "DELETE FROM autofill_profile_names")?;
+            execute_optional(&conn, "DELETE FROM autofill_profile_emails")?;
+            execute_optional(&conn, "DELETE FROM autofill_profile_phones")?;
+            execute_optional(&conn, "DELETE FROM autofill_profile_addresses")?;
+            execute_optional(&conn, "DELETE FROM autofill_profile_birthdates")?;
+            execute_optional(&conn, "DELETE FROM autofill_sync_metadata")?;
+        }
+        BrowserDbKind::ChromiumPasswords => {
+            execute_optional(&conn, "DELETE FROM logins")?;
+            execute_optional(&conn, "DELETE FROM stats")?;
+            execute_optional(&conn, "DELETE FROM insecure_credentials")?;
+            execute_optional(&conn, "DELETE FROM password_notes")?;
+            execute_optional(&conn, "DELETE FROM password_issues")?;
+            execute_optional(&conn, "DELETE FROM compromised_credentials")?;
+        }
         BrowserDbKind::FirefoxHistory => {
             execute_optional(&conn, "DELETE FROM moz_historyvisits")?;
             execute_optional(
@@ -1735,6 +2842,10 @@ fn clean_browser_database(
                 "DELETE FROM moz_annos WHERE anno_attribute_id IN (SELECT id FROM moz_anno_attributes WHERE name LIKE '%downloads%')",
             )?;
         }
+        BrowserDbKind::FirefoxFormHistory => {
+            execute_optional(&conn, "DELETE FROM moz_formhistory")?;
+            execute_optional(&conn, "DELETE FROM moz_deleted_formhistory")?;
+        }
     }
 
     let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;");
@@ -1745,6 +2856,72 @@ fn clean_browser_database(
         freed_bytes: before,
         errors: Vec::new(),
     })
+}
+
+#[cfg(windows)]
+fn clean_browser_json(path: &Path, kind: &BrowserJsonKind) -> Result<ActionOutcome, String> {
+    if !path.exists() {
+        return Ok(ActionOutcome {
+            freed_bytes: 0,
+            errors: Vec::new(),
+        });
+    }
+
+    let before = file_size(path);
+    let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let mut json: serde_json::Value =
+        serde_json::from_str(&text).map_err(|error| error.to_string())?;
+    let mut changed = false;
+
+    match kind {
+        BrowserJsonKind::ChromiumLastDownloadLocation => {
+            changed |= remove_json_path(&mut json, &["download", "default_directory"]);
+            changed |= remove_json_path(&mut json, &["download", "savefile", "default_directory"]);
+        }
+        BrowserJsonKind::ChromiumSitePreferences => {
+            changed |= remove_json_path(&mut json, &["profile", "content_settings", "exceptions"]);
+            changed |=
+                remove_json_path(&mut json, &["profile", "content_settings", "pattern_pairs"]);
+            changed |= remove_json_path(&mut json, &["partition", "per_host_zoom_levels"]);
+            changed |= remove_json_path(&mut json, &["partition", "per_host_content_settings"]);
+        }
+        BrowserJsonKind::FirefoxPasswords => {
+            if let Some(object) = json.as_object_mut() {
+                object.insert("logins".to_string(), serde_json::Value::Array(Vec::new()));
+                object.insert(
+                    "disabledHosts".to_string(),
+                    serde_json::Value::Array(Vec::new()),
+                );
+                changed = true;
+            }
+        }
+    }
+
+    if changed {
+        let serialized = serde_json::to_string_pretty(&json).map_err(|error| error.to_string())?;
+        fs::write(path, serialized).map_err(|error| error.to_string())?;
+    }
+
+    Ok(ActionOutcome {
+        freed_bytes: before.saturating_sub(file_size(path)),
+        errors: Vec::new(),
+    })
+}
+
+fn remove_json_path(value: &mut serde_json::Value, path: &[&str]) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let Some(object) = value.as_object_mut() else {
+        return false;
+    };
+    if path.len() == 1 {
+        return object.remove(path[0]).is_some();
+    }
+    object
+        .get_mut(path[0])
+        .map(|child| remove_json_path(child, &path[1..]))
+        .unwrap_or(false)
 }
 
 #[cfg(windows)]
@@ -1795,26 +2972,29 @@ fn delete_registry_target(
     value_name: Option<&str>,
     delete_key: bool,
 ) -> Result<ActionOutcome, String> {
-    let mut command = Command::new("reg");
-    command.arg("delete").arg(key_path);
+    use winreg::enums::{KEY_SET_VALUE, KEY_WRITE};
+
     if delete_key {
-        command.arg("/f");
-    } else if let Some(value) = value_name {
-        if value.is_empty() {
-            command.arg("/ve").arg("/f");
-        } else {
-            command.arg("/v").arg(value).arg("/f");
+        let (root, subkey, _) = split_registry_path(key_path)?;
+        if subkey.trim().is_empty() {
+            return Err("拒绝删除注册表根键".to_string());
         }
-    }
-    let output = command.output().map_err(|error| error.to_string())?;
-    if output.status.success() {
-        Ok(ActionOutcome {
-            freed_bytes: 0,
-            errors: Vec::new(),
-        })
+        root.delete_subkey_all(subkey)
+            .map_err(|error| error.to_string())?;
+    } else if let Some(value) = value_name {
+        let (root, subkey, _) = split_registry_path(key_path)?;
+        let key = root
+            .open_subkey_with_flags(subkey, KEY_SET_VALUE | KEY_WRITE)
+            .map_err(|error| error.to_string())?;
+        key.delete_value(value).map_err(|error| error.to_string())?;
     } else {
-        Err(command_error("reg delete", &output))
+        return Err("注册表删除目标不完整".to_string());
     }
+
+    Ok(ActionOutcome {
+        freed_bytes: 0,
+        errors: Vec::new(),
+    })
 }
 
 fn backup_registry_before_delete(
@@ -1839,29 +3019,9 @@ fn backup_registry_before_delete(
     let final_path = dir.join(format!("registry_backup_{}.reg", timestamp));
     let mut combined = String::from("Windows Registry Editor Version 5.00\r\n\r\n");
 
-    for (index, key) in keys.iter().enumerate() {
-        let part_path = dir.join(format!("registry_backup_{}_part_{}.reg", timestamp, index));
-        let output = Command::new("reg")
-            .arg("export")
-            .arg(key)
-            .arg(&part_path)
-            .arg("/y")
-            .output()
-            .map_err(|error| error.to_string())?;
-        if !output.status.success() {
-            let _ = fs::remove_file(&part_path);
-            return Err(command_error("reg export", &output));
-        }
-        let text = read_reg_file(&part_path).map_err(|error| error.to_string())?;
-        let body = text
-            .lines()
-            .skip_while(|line| line.trim().is_empty())
-            .skip(1)
-            .collect::<Vec<_>>()
-            .join("\r\n");
-        combined.push_str(&body);
-        combined.push_str("\r\n\r\n");
-        let _ = fs::remove_file(&part_path);
+    for key in &keys {
+        export_registry_key(key, &mut combined)
+            .map_err(|error| format!("注册表备份失败 {}: {}", key, error))?;
     }
 
     write_utf16le_with_bom(&final_path, &combined).map_err(|error| error.to_string())?;
@@ -1880,11 +3040,7 @@ fn backup_dir(app: &tauri::AppHandle) -> PathBuf {
 }
 
 fn is_admin() -> bool {
-    Command::new("net")
-        .arg("session")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+    unsafe { IsUserAnAdmin().as_bool() }
 }
 
 fn running_processes(process_names: &[String]) -> Vec<String> {
@@ -1892,28 +3048,15 @@ fn running_processes(process_names: &[String]) -> Vec<String> {
         return Vec::new();
     }
 
-    let output = match Command::new("tasklist")
-        .args(["/FO", "CSV", "/NH"])
-        .output()
-    {
-        Ok(value) => value,
-        Err(_) => return Vec::new(),
-    };
-    if !output.status.success() {
-        return Vec::new();
-    }
     let wanted = process_names
         .iter()
         .map(|name| name.to_ascii_lowercase())
         .collect::<HashSet<_>>();
-    let text = String::from_utf8_lossy(&output.stdout);
     let mut running = HashSet::new();
-    for line in text.lines() {
-        if let Some(name) = parse_tasklist_name(line) {
-            let lower = name.to_ascii_lowercase();
-            if wanted.contains(&lower) {
-                running.insert(name);
-            }
+    for (name, _) in process_entries() {
+        let lower = name.to_ascii_lowercase();
+        if wanted.contains(&lower) {
+            running.insert(name);
         }
     }
     let mut result = running.into_iter().collect::<Vec<_>>();
@@ -1922,54 +3065,268 @@ fn running_processes(process_names: &[String]) -> Vec<String> {
 }
 
 fn kill_process(process_name: &str) {
-    let _ = Command::new("taskkill")
-        .args(["/F", "/T", "/IM", process_name])
-        .output();
-}
-
-fn parse_tasklist_name(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    if trimmed.starts_with('"') {
-        let mut chars = trimmed.chars();
-        chars.next();
-        let mut name = String::new();
-        for ch in chars {
-            if ch == '"' {
-                return Some(name);
+    let wanted = process_name.to_ascii_lowercase();
+    for (name, pid) in process_entries() {
+        if name.to_ascii_lowercase() == wanted {
+            if let Ok(handle) = unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) } {
+                let _ = unsafe { TerminateProcess(handle, 1) };
+                let _ = unsafe { CloseHandle(handle) };
             }
-            name.push(ch);
         }
-        None
-    } else {
-        trimmed.split(',').next().map(|value| value.to_string())
     }
 }
 
-fn run_simple_command(program: &str, args: &[&str]) -> Result<(), String> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|error| error.to_string())?;
-    if output.status.success() {
+#[cfg(windows)]
+fn registry_key_has_content(key_path: &str) -> bool {
+    use winreg::enums::KEY_READ;
+
+    let Ok((root, subkey, _)) = split_registry_path(key_path) else {
+        return false;
+    };
+    let Ok(key) = root.open_subkey_with_flags(subkey, KEY_READ) else {
+        return false;
+    };
+    key.enum_values().next().is_some() || key.enum_keys().next().is_some()
+}
+
+#[cfg(windows)]
+fn registry_value_exists(key_path: &str, value_name: &str) -> bool {
+    use winreg::enums::KEY_READ;
+
+    let Ok((root, subkey, _)) = split_registry_path(key_path) else {
+        return false;
+    };
+    let Ok(key) = root.open_subkey_with_flags(subkey, KEY_READ) else {
+        return false;
+    };
+    key.get_raw_value(value_name).is_ok()
+}
+
+#[cfg(windows)]
+fn shell_execute(verb: &str, file: &str, parameters: Option<&str>) -> Result<(), String> {
+    let verb = to_wide_null(verb);
+    let file = to_wide_null(file);
+    let parameters = parameters.map(to_wide_null);
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(file.as_ptr()),
+            parameters
+                .as_ref()
+                .map(|value| PCWSTR(value.as_ptr()))
+                .unwrap_or_else(PCWSTR::null),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result.0 as isize > 32 {
         Ok(())
     } else {
-        Err(command_error(program, &output))
+        Err(format!(
+            "ShellExecuteW 执行失败，错误码 {}",
+            result.0 as isize
+        ))
     }
 }
 
-fn command_error(command: &str, output: &std::process::Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let message = if !stderr.trim().is_empty() {
-        stderr.trim()
+#[cfg(windows)]
+fn flush_dns_cache() -> Result<(), String> {
+    let ok = unsafe { DnsFlushResolverCache() };
+    if ok != 0 {
+        Ok(())
     } else {
-        stdout.trim()
-    };
-    if message.is_empty() {
-        format!("{} 执行失败", command)
-    } else {
-        format!("{} 执行失败: {}", command, message)
+        Err("DNS 缓存刷新失败".to_string())
     }
+}
+
+#[cfg(windows)]
+fn clear_clipboard_api() -> Result<(), String> {
+    unsafe { OpenClipboard(None) }.map_err(|error| error.to_string())?;
+    let result = unsafe { EmptyClipboard() }.map_err(|error| error.to_string());
+    let _ = unsafe { CloseClipboard() };
+    result
+}
+
+#[cfg(windows)]
+fn process_entries() -> Vec<(String, u32)> {
+    let snapshot = match unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) } {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut result = Vec::new();
+    if unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok() {
+        loop {
+            let name = wide_array_to_string(&entry.szExeFile);
+            if !name.is_empty() {
+                result.push((name, entry.th32ProcessID));
+            }
+            if unsafe { Process32NextW(snapshot, &mut entry) }.is_err() {
+                break;
+            }
+        }
+    }
+    let _ = unsafe { CloseHandle(snapshot) };
+    result
+}
+
+#[cfg(windows)]
+fn split_registry_path(key_path: &str) -> Result<(winreg::RegKey, String, String), String> {
+    use winreg::enums::{
+        HKEY_CLASSES_ROOT, HKEY_CURRENT_CONFIG, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, HKEY_USERS,
+    };
+    use winreg::RegKey;
+
+    let normalized = key_path.trim().replace('/', "\\");
+    let mut parts = normalized.splitn(2, '\\');
+    let root_label = parts
+        .next()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "注册表路径缺少根键".to_string())?;
+    let subkey = parts.next().unwrap_or("").trim_matches('\\').to_string();
+    let (root, canonical) = match root_label.to_ascii_uppercase().as_str() {
+        "HKCU" | "HKEY_CURRENT_USER" => (
+            RegKey::predef(HKEY_CURRENT_USER),
+            "HKEY_CURRENT_USER".to_string(),
+        ),
+        "HKLM" | "HKEY_LOCAL_MACHINE" => (
+            RegKey::predef(HKEY_LOCAL_MACHINE),
+            "HKEY_LOCAL_MACHINE".to_string(),
+        ),
+        "HKCR" | "HKEY_CLASSES_ROOT" => (
+            RegKey::predef(HKEY_CLASSES_ROOT),
+            "HKEY_CLASSES_ROOT".to_string(),
+        ),
+        "HKU" | "HKEY_USERS" => (RegKey::predef(HKEY_USERS), "HKEY_USERS".to_string()),
+        "HKCC" | "HKEY_CURRENT_CONFIG" => (
+            RegKey::predef(HKEY_CURRENT_CONFIG),
+            "HKEY_CURRENT_CONFIG".to_string(),
+        ),
+        _ => return Err(format!("不支持的注册表根键: {}", root_label)),
+    };
+    Ok((root, subkey, canonical))
+}
+
+#[cfg(windows)]
+fn export_registry_key(key_path: &str, output: &mut String) -> Result<(), String> {
+    use winreg::enums::KEY_READ;
+
+    let (root, subkey, canonical) = split_registry_path(key_path)?;
+    let key = root
+        .open_subkey_with_flags(&subkey, KEY_READ)
+        .map_err(|error| error.to_string())?;
+    let full_path = if subkey.is_empty() {
+        canonical.clone()
+    } else {
+        format!("{}\\{}", canonical, subkey)
+    };
+
+    output.push_str(&format!("[{}]\r\n", full_path));
+    let mut values = key.enum_values().flatten().collect::<Vec<_>>();
+    values.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, value) in values {
+        output.push_str(&format!(
+            "{}={}\r\n",
+            format_reg_value_name(&name),
+            format_reg_value_data(&value)
+        ));
+    }
+    output.push_str("\r\n");
+
+    let mut children = key.enum_keys().flatten().collect::<Vec<_>>();
+    children.sort();
+    for child in children {
+        let child_path = if subkey.is_empty() {
+            format!("{}\\{}", canonical, child)
+        } else {
+            format!("{}\\{}\\{}", canonical, subkey, child)
+        };
+        export_registry_key(&child_path, output)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn format_reg_value_name(name: &str) -> String {
+    if name.is_empty() {
+        "@".to_string()
+    } else {
+        format!("\"{}\"", escape_reg_string(name))
+    }
+}
+
+#[cfg(windows)]
+fn format_reg_value_data(value: &winreg::RegValue) -> String {
+    use winreg::enums::{REG_BINARY, REG_DWORD, REG_EXPAND_SZ, REG_MULTI_SZ, REG_QWORD, REG_SZ};
+
+    match value.vtype.clone() {
+        REG_SZ => format!(
+            "\"{}\"",
+            escape_reg_string(&utf16le_bytes_to_string(&value.bytes))
+        ),
+        REG_DWORD => {
+            let number = value
+                .bytes
+                .get(0..4)
+                .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                .unwrap_or(0);
+            format!("dword:{:08x}", number)
+        }
+        REG_BINARY => format!("hex:{}", format_hex_bytes(&value.bytes)),
+        REG_EXPAND_SZ => format!("hex(2):{}", format_hex_bytes(&value.bytes)),
+        REG_MULTI_SZ => format!("hex(7):{}", format_hex_bytes(&value.bytes)),
+        REG_QWORD => format!("hex(b):{}", format_hex_bytes(&value.bytes)),
+        other => format!(
+            "hex({:x}):{}",
+            other as isize,
+            format_hex_bytes(&value.bytes)
+        ),
+    }
+}
+
+#[cfg(windows)]
+fn format_hex_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{:02x}", byte))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[cfg(windows)]
+fn escape_reg_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(windows)]
+fn utf16le_bytes_to_string(bytes: &[u8]) -> String {
+    let mut units = bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect::<Vec<_>>();
+    while units.last() == Some(&0) {
+        units.pop();
+    }
+    String::from_utf16_lossy(&units)
+}
+
+#[cfg(windows)]
+fn to_wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(windows)]
+fn wide_array_to_string(buffer: &[u16]) -> String {
+    let len = buffer
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(buffer.len());
+    String::from_utf16_lossy(&buffer[..len])
 }
 
 #[cfg(windows)]
@@ -2033,10 +3390,46 @@ fn chromium_profiles(base: &Path) -> Vec<PathBuf> {
 
 #[cfg(windows)]
 fn recycle_bin_roots() -> Vec<PathBuf> {
-    (b'A'..=b'Z')
-        .map(|letter| PathBuf::from(format!("{}:\\$Recycle.Bin", letter as char)))
+    drive_roots()
+        .into_iter()
+        .map(|root| root.join("$Recycle.Bin"))
         .filter(|path| path.exists())
         .collect()
+}
+
+#[cfg(windows)]
+fn drive_roots() -> Vec<PathBuf> {
+    (b'A'..=b'Z')
+        .map(|letter| PathBuf::from(format!("{}:\\", letter as char)))
+        .filter(|path| path.exists())
+        .collect()
+}
+
+#[cfg(windows)]
+fn chkdsk_fragment_paths() -> Vec<PathBuf> {
+    let mut result = Vec::new();
+    for root in drive_roots() {
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+                continue;
+            };
+            let lower = name.to_ascii_lowercase();
+            if lower.starts_with("found.")
+                || path
+                    .extension()
+                    .and_then(OsStr::to_str)
+                    .map(|ext| ext.eq_ignore_ascii_case("chk"))
+                    .unwrap_or(false)
+            {
+                result.push(path);
+            }
+        }
+    }
+    result
 }
 
 struct FileCollection {
@@ -2156,7 +3549,7 @@ fn join_paths(paths: &[PathBuf]) -> String {
 #[cfg(windows)]
 fn registry_command_path_missing(command: &str) -> bool {
     executable_path_from_command(command)
-        .map(|path| !path.exists())
+        .map(|path| !registry_path_exists(&path))
         .unwrap_or(false)
 }
 
@@ -2189,9 +3582,47 @@ fn executable_path_from_command(command: &str) -> Option<PathBuf> {
     let trimmed = candidate.trim().trim_matches('"').trim_matches('\'');
     if trimmed.is_empty() {
         None
+    } else if trimmed.to_ascii_lowercase().starts_with("\\systemroot\\") {
+        Some(windows_dir().join(&trimmed["\\SystemRoot\\".len()..]))
     } else {
         Some(PathBuf::from(trimmed))
     }
+}
+
+#[cfg(windows)]
+fn registry_path_exists(path: &Path) -> bool {
+    if path.exists() {
+        return true;
+    }
+    let value = path.display().to_string();
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with("system32\\") || lower.starts_with("syswow64\\") {
+        return windows_dir().join(&value).exists();
+    }
+    if lower.starts_with("drivers\\") {
+        return windows_dir().join("System32").join(&value).exists();
+    }
+    false
+}
+
+#[cfg(windows)]
+fn mui_cache_target_missing(value_name: &str) -> bool {
+    let stripped = [
+        ".friendlyappname",
+        ".applicationcompany",
+        ".applicationdescription",
+        ".applicationicon",
+    ]
+    .iter()
+    .find_map(|suffix| {
+        value_name
+            .to_ascii_lowercase()
+            .rfind(suffix)
+            .map(|index| value_name[..index].to_string())
+    })
+    .unwrap_or_else(|| value_name.to_string());
+    let path = PathBuf::from(expand_env_vars(stripped.trim()));
+    !path.as_os_str().is_empty() && !registry_path_exists(&path)
 }
 
 #[cfg(windows)]
@@ -2228,19 +3659,6 @@ fn remove_sqlite_sidecars(db_path: &Path) {
     let base = db_path.display().to_string();
     for suffix in ["-wal", "-shm", "-journal"] {
         let _ = fs::remove_file(format!("{}{}", base, suffix));
-    }
-}
-
-fn read_reg_file(path: &Path) -> io::Result<String> {
-    let bytes = fs::read(path)?;
-    if bytes.starts_with(&[0xff, 0xfe]) {
-        let mut units = Vec::new();
-        for chunk in bytes[2..].chunks_exact(2) {
-            units.push(u16::from_le_bytes([chunk[0], chunk[1]]));
-        }
-        Ok(String::from_utf16_lossy(&units))
-    } else {
-        Ok(String::from_utf8_lossy(&bytes).to_string())
     }
 }
 

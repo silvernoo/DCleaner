@@ -21,3 +21,11 @@ walkdir = "2.5"
 [target.'cfg(windows)'.dependencies]
 rusqlite = { version = "0.31", features = ["bundled"] }
 winreg = "0.52"
+windows = { version = "0.61.3", features = [
+  "Win32_Foundation",
+  "Win32_System_DataExchange",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_Threading",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging"
+] }

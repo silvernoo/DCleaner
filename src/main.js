@@ -275,6 +275,7 @@ function groupKey(moduleId, category) {
 function treeGroups() {
   const modulesWithItems = modules
     .filter((module) => !["all", "restore"].includes(module.id))
+    .filter((module) => state.activeModule === "all" || module.id === state.activeModule)
     .map((module) => {
       const moduleItems = state.items.filter((item) => item.module === module.id);
       const categories = [...new Set(moduleItems.map((item) => item.category || "其他"))].map(
@@ -299,9 +300,6 @@ function expandedTreeKeys() {
   const keys = new Set();
   for (const module of treeGroups()) {
     keys.add(module.id);
-    for (const category of module.categories) {
-      keys.add(category.key);
-    }
   }
   return keys;
 }
@@ -408,79 +406,7 @@ function escapeHtml(value) {
 }
 
 function renderItems() {
-  if (state.activeModule === "all") {
-    return renderTreeItems();
-  }
-
-  const items = pageItems();
-  const total = visibleItems().length;
-  const pages = Math.max(1, Math.ceil(total / state.pageSize));
-
-  if (!items.length) {
-    return `<div class="panel"><div class="empty">暂无扫描结果</div></div>`;
-  }
-
-  const rows = items
-    .map((item) => {
-      const checked = state.selected.has(item.id) ? "checked" : "";
-      const expanded = state.expanded.has(item.id);
-      const children =
-        expanded && item.children.length
-          ? `<div class="children">
-              ${item.children
-                .map(
-                  (child) => `
-                    <div class="child-line">
-                      <span>${escapeHtml(child.path)}</span>
-                      <span>${formatBytes(child.sizeBytes)}</span>
-                    </div>`
-                )
-                .join("")}
-            </div>`
-          : "";
-      return `
-        <div class="item-row">
-          <label><input type="checkbox" data-select="${item.id}" ${checked} /></label>
-          <span>${moduleLabel(item.module)}</span>
-          <span class="name">
-            <strong title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</strong>
-            <small title="${escapeHtml(item.detail)}">${escapeHtml(item.detail)}</small>
-          </span>
-          <span class="path" title="${escapeHtml(item.path)}">${escapeHtml(item.path)}</span>
-          <span>${formatBytes(item.sizeBytes)}</span>
-          <span class="risk ${item.risk}">${riskLabel(item.risk)}</span>
-          <span class="row-action">
-            ${
-              item.children.length
-                ? `<button data-expand="${item.id}">${expanded ? "收起" : "展开"} ${item.children.length}</button>`
-                : ""
-            }
-          </span>
-          ${children}
-        </div>
-      `;
-    })
-    .join("");
-
-  return `
-    <div class="panel">
-      <div class="table-head">
-        <span></span>
-        <span>模块</span>
-        <span>项目</span>
-        <span>路径 / 键值</span>
-        <span>大小</span>
-        <span>风险</span>
-        <span>详情</span>
-      </div>
-      ${rows}
-      <div class="pager">
-        <button data-action="prev-page" ${state.page <= 1 ? "disabled" : ""}>上一页</button>
-        <span>${state.page} / ${pages}</span>
-        <button data-action="next-page" ${state.page >= pages ? "disabled" : ""}>下一页</button>
-      </div>
-    </div>
-  `;
+  return renderTreeItems();
 }
 
 function renderTreeItems() {
