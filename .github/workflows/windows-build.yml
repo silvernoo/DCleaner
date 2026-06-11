@@ -2,11 +2,19 @@ name: Windows Build
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Optional release tag, for example v0.1.0. Leave empty to build artifact only."
+        required: false
+        default: ""
   push:
     branches:
       - main
     tags:
       - "v*"
+
+permissions:
+  contents: write
 
 jobs:
   build-windows:
@@ -41,14 +49,45 @@ jobs:
         working-directory: src-tauri
         run: cargo check
 
-      - name: Build Tauri Windows package
-        run: npm run tauri:build
+      - name: Build Tauri Windows executable
+        run: npm run tauri:build -- --no-bundle
 
-      - name: Upload Windows artifacts
+      - name: Package single executable zip
+        shell: pwsh
+        run: |
+          $releaseDir = "release"
+          New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+          Copy-Item "src-tauri/target/release/dcleaner.exe" "$releaseDir/DCleaner.exe" -Force
+          Compress-Archive -Path "$releaseDir/DCleaner.exe" -DestinationPath "DCleaner-windows-x64.zip" -Force
+          $hash = Get-FileHash "DCleaner-windows-x64.zip" -Algorithm SHA256
+          "### Windows zip" >> $env:GITHUB_STEP_SUMMARY
+          "Asset: ``DCleaner-windows-x64.zip``" >> $env:GITHUB_STEP_SUMMARY
+          "SHA256: ``$($hash.Hash.ToLower())``" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload Windows zip artifact
         uses: actions/upload-artifact@v4
         with:
-          name: dcleaner-windows-x64
+          name: dcleaner-windows-x64-zip
           if-no-files-found: error
-          path: |
-            src-tauri/target/release/dcleaner.exe
-            src-tauri/target/release/bundle/nsis/*.exe
+          path: DCleaner-windows-x64.zip
+
+      - name: Resolve release tag
+        id: release
+        shell: pwsh
+        run: |
+          $tag = ""
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $tag = "${{ github.ref_name }}"
+          } elseif ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $tag = "${{ inputs.release_tag }}"
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Upload zip to GitHub Release
+        if: steps.release.outputs.tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          name: DCleaner ${{ steps.release.outputs.tag }}
+          files: DCleaner-windows-x64.zip
+          fail_on_unmatched_files: true
