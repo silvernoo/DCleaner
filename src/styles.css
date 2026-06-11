@@ -301,6 +301,7 @@ input[type="checkbox"] {
 
 .tree-row {
   display: grid;
+  grid-template-columns: 28px 26px minmax(0, 1fr) 100px 100px 88px 150px;
   align-items: center;
   gap: 10px;
   min-height: 42px;
@@ -308,9 +309,12 @@ input[type="checkbox"] {
   font-size: 13px;
 }
 
-.module-row,
-.category-row {
-  grid-template-columns: 28px 26px minmax(260px, 1fr) 92px 110px;
+.tree-header {
+  min-height: 32px;
+  border: 1px solid transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
 }
 
 .module-row {
@@ -319,17 +323,13 @@ input[type="checkbox"] {
 
 .category-row {
   background: #fbfcfe;
-  padding-left: 30px;
 }
 
 .leaf-row {
-  grid-template-columns: 28px 26px minmax(190px, 1.2fr) minmax(220px, 1.6fr) 94px 82px 132px;
   border-top: 1px solid #edf1f6;
-  padding-left: 52px;
 }
 
 .tree-row strong,
-.tree-row .path,
 .tree-row small {
   min-width: 0;
   overflow: hidden;
@@ -343,6 +343,38 @@ input[type="checkbox"] {
 
 .tree-row .name strong {
   display: block;
+}
+
+.tree-name {
+  min-width: 0;
+}
+
+.category-name {
+  padding-left: 22px;
+}
+
+.leaf-name {
+  padding-left: 44px;
+}
+
+.tree-count,
+.tree-size {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  width: 100%;
+}
+
+.tree-count {
+  text-align: right;
+}
+
+.tree-size {
+  text-align: right;
+}
+
+.tree-actions-label {
+  text-align: right;
 }
 
 .twisty {
@@ -420,8 +452,7 @@ input[type="checkbox"] {
   white-space: nowrap;
 }
 
-.item-row small,
-.path {
+.item-row small {
   display: block;
   overflow: hidden;
   color: var(--muted);
@@ -465,9 +496,12 @@ input[type="checkbox"] {
   justify-content: flex-end;
   gap: 6px;
   min-width: 0;
+  width: 100%;
+  white-space: nowrap;
 }
 
 .row-actions button {
+  flex: 0 0 auto;
   min-height: 28px;
   padding: 0 8px;
   font-size: 12px;
@@ -526,7 +560,7 @@ input[type="checkbox"] {
 
 .whitelist-row {
   display: grid;
-  grid-template-columns: 110px 150px minmax(280px, 1fr) 90px 92px;
+  grid-template-columns: 110px 150px minmax(320px, 1fr) 90px 92px;
   align-items: center;
   gap: 12px;
   min-height: 58px;

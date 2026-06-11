@@ -91,22 +91,22 @@ function totals() {
 
 function showToast(message) {
   state.toast = message;
-  render();
+  render({ preserveScroll: true });
   window.clearTimeout(showToast.timer);
   showToast.timer = window.setTimeout(() => {
     state.toast = "";
-    render();
+    render({ preserveScroll: true });
   }, 3600);
 }
 
 async function loadEnvironment() {
   state.env = await invoke("get_environment");
-  render();
+  render({ preserveScroll: true });
 }
 
 async function loadBackups() {
   state.backups = await invoke("list_backups");
-  render();
+  render({ preserveScroll: true });
 }
 
 async function runScan() {
@@ -197,14 +197,14 @@ function addItemsToWhitelist(items) {
   state.items = filterWhitelistedItems(state.items);
   saveWhitelist();
   showToast(`已加入白名单：${addable.length} 项。`);
-  render();
+  render({ preserveScroll: true });
 }
 
 function removeWhitelistEntry(key) {
   state.itemWhitelist = state.itemWhitelist.filter((item) => item.key !== key);
   saveWhitelist();
   showToast("已从白名单移除，重新扫描后会再次显示。");
-  render();
+  render({ preserveScroll: true });
 }
 
 async function executeSelected(decisions = {}) {
@@ -281,7 +281,7 @@ function toggleAllVisible(checked) {
     if (checked) state.selected.add(item.id);
     else state.selected.delete(item.id);
   }
-  render();
+  render({ preserveScroll: true });
 }
 
 function groupKey(moduleId, category) {
@@ -334,7 +334,7 @@ function toggleItems(items, checked) {
     if (checked) state.selected.add(item.id);
     else state.selected.delete(item.id);
   }
-  render();
+  render({ preserveScroll: true });
 }
 
 function renderNav() {
@@ -402,7 +402,6 @@ function renderToolbar() {
         <button data-action="whitelist-selected" ${state.selected.size ? "" : "disabled"}>加入白名单</button>
         <button class="danger" data-action="execute" ${state.executing || !state.selected.size ? "disabled" : ""}>执行清理</button>
       </div>
-      <div class="toolbar-note">白名单项会从本次结果移除，并在下次扫描隐藏。</div>
     </div>
   `;
 }
@@ -427,6 +426,15 @@ function renderTreeItems() {
 
   return `
     <div class="tree-panel">
+      <div class="tree-row tree-header">
+        <span></span>
+        <span></span>
+        <span>项目</span>
+        <span class="tree-count">数量</span>
+        <span class="tree-size">容量</span>
+        <span>风险</span>
+        <span class="tree-actions-label">操作</span>
+      </div>
       ${grouped.map(renderModuleGroup).join("")}
     </div>
   `;
@@ -441,9 +449,11 @@ function renderModuleGroup(module) {
       <div class="tree-row module-row">
         <button class="twisty" data-expand="${module.id}" title="${expanded ? "收起" : "展开"}">${expanded ? "▾" : "▸"}</button>
         <input type="checkbox" data-select-group="${module.id}" ${moduleState.checked ? "checked" : ""} ${moduleState.partial ? "data-partial=\"true\"" : ""} />
-        <strong>${module.label}</strong>
-        <span>${moduleState.checkedCount} / ${module.items.length}</span>
-        <span>${formatBytes(totalSize)}</span>
+        <strong class="tree-name module-name">${module.label}</strong>
+        <span class="tree-count">${moduleState.checkedCount} / ${module.items.length}</span>
+        <span class="tree-size">${formatBytes(totalSize)}</span>
+        <span></span>
+        <span></span>
       </div>
       ${
         expanded
@@ -465,9 +475,11 @@ function renderCategoryGroup(moduleId, category) {
       <div class="tree-row category-row">
         <button class="twisty" data-expand="${category.key}" title="${expanded ? "收起" : "展开"}">${expanded ? "▾" : "▸"}</button>
         <input type="checkbox" data-select-group="${category.key}" ${categoryState.checked ? "checked" : ""} ${categoryState.partial ? "data-partial=\"true\"" : ""} />
-        <strong>${escapeHtml(category.category)}</strong>
-        <span>${categoryState.checkedCount} / ${category.items.length}</span>
-        <span>${formatBytes(totalSize)}</span>
+        <strong class="tree-name category-name">${escapeHtml(category.category)}</strong>
+        <span class="tree-count">${categoryState.checkedCount} / ${category.items.length}</span>
+        <span class="tree-size">${formatBytes(totalSize)}</span>
+        <span></span>
+        <span></span>
       </div>
       ${
         expanded
@@ -483,6 +495,7 @@ function renderCategoryGroup(moduleId, category) {
 function renderTreeItem(moduleId, category, item) {
   const checked = state.selected.has(item.id) ? "checked" : "";
   const expanded = state.expanded.has(item.id);
+  const detailTitle = `${item.detail}${item.path ? `\n${item.path}` : ""}`;
   const children =
     expanded && item.children.length
       ? `<div class="tree-file-list">
@@ -502,12 +515,12 @@ function renderTreeItem(moduleId, category, item) {
       <div class="tree-row leaf-row">
         <span></span>
         <input type="checkbox" data-select="${item.id}" ${checked} />
-        <span class="name">
+        <span class="name tree-name leaf-name">
           <strong title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</strong>
-          <small title="${escapeHtml(item.detail)}">${escapeHtml(item.detail)}</small>
+          <small title="${escapeHtml(detailTitle)}">${escapeHtml(item.detail)}</small>
         </span>
-        <span class="path" title="${escapeHtml(item.path)}">${escapeHtml(item.path)}</span>
-        <span>${formatBytes(item.sizeBytes)}</span>
+        <span class="tree-count placeholder"></span>
+        <span class="tree-size">${formatBytes(item.sizeBytes)}</span>
         <span class="risk ${item.risk}">${riskLabel(item.risk)}</span>
         <span class="row-actions">
           ${
@@ -561,7 +574,6 @@ function renderWhitelistPage() {
               <span>${escapeHtml(entry.category || "其他")}</span>
               <span class="name">
                 <strong title="${escapeHtml(entry.name)}">${escapeHtml(entry.name)}</strong>
-                <small title="${escapeHtml(entry.path)}">${escapeHtml(entry.path)}</small>
               </span>
               <span class="risk ${entry.risk}">${riskLabel(entry.risk)}</span>
               <button data-remove-whitelist="${escapeHtml(entry.key)}">移除</button>
@@ -641,7 +653,9 @@ function renderWarnings() {
   `;
 }
 
-function render() {
+function render(options = {}) {
+  const previousMain = app.querySelector(".main");
+  const previousScrollTop = options.preserveScroll ? previousMain?.scrollTop || 0 : 0;
   const data = totals();
   const env = state.env;
   const isRestore = state.activeModule === "restore";
@@ -655,7 +669,6 @@ function render() {
         </div>
         <nav class="nav">${renderNav()}</nav>
         <div class="sidebar-footer">
-          <div>扫描后默认不勾选。</div>
           <div>注册表清理会先生成 .reg 备份。</div>
         </div>
       </aside>
@@ -686,6 +699,13 @@ function render() {
     ${state.toast ? `<div class="toast">${escapeHtml(state.toast)}</div>` : ""}
   `;
   syncPartialCheckboxes();
+  if (options.preserveScroll) {
+    const main = app.querySelector(".main");
+    if (main) {
+      const maxScrollTop = Math.max(0, main.scrollHeight - main.clientHeight);
+      main.scrollTop = Math.min(previousScrollTop, maxScrollTop);
+    }
+  }
 }
 
 app.addEventListener("click", async (event) => {
@@ -695,7 +715,7 @@ app.addEventListener("click", async (event) => {
   if (checkbox?.dataset.select) {
     if (checkbox.checked) state.selected.add(checkbox.dataset.select);
     else state.selected.delete(checkbox.dataset.select);
-    render();
+    render({ preserveScroll: true });
     return;
   }
 
@@ -730,7 +750,7 @@ app.addEventListener("click", async (event) => {
   if (expand) {
     if (state.expanded.has(expand)) state.expanded.delete(expand);
     else state.expanded.add(expand);
-    render();
+    render({ preserveScroll: true });
     return;
   }
 
@@ -762,7 +782,7 @@ app.addEventListener("click", async (event) => {
       state.itemWhitelist = [];
       saveWhitelist();
       showToast("白名单已清空，重新扫描后恢复显示。");
-      render();
+      render({ preserveScroll: true });
     }
   }
   if (action === "select-visible") toggleAllVisible(true);
@@ -781,7 +801,7 @@ app.addEventListener("click", async (event) => {
 
 listen("clean-progress", (event) => {
   state.progress = event.payload;
-  render();
+  render({ preserveScroll: true });
 });
 
 function syncPartialCheckboxes() {
