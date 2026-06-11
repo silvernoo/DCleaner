@@ -1,0 +1,23 @@
+[package]
+name = "dcleaner"
+version = "0.1.0"
+description = "A lightweight Windows cleaner built with Tauri and Rust"
+authors = ["DCleaner"]
+edition = "2021"
+
+[lib]
+name = "dcleaner_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.2.0", features = [] }
+
+[dependencies]
+tauri = { version = "2.5.0", features = [] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+walkdir = "2.5"
+
+[target.'cfg(windows)'.dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
+winreg = "0.52"
