@@ -8,15 +8,18 @@ const modules = [
   { id: "browser", label: "浏览器" },
   { id: "application", label: "第三方应用" },
   { id: "registry", label: "注册表" },
+  { id: "whitelist", label: "白名单" },
   { id: "restore", label: "恢复中心" }
 ];
 
-const whitelistStorageKey = "dcleaner.cookieWhitelist";
+const whitelistStorageKey = "dcleaner.itemWhitelist";
 
 function loadWhitelist() {
   try {
     const value = JSON.parse(window.localStorage.getItem(whitelistStorageKey) || "[]");
-    return Array.isArray(value) ? value.filter(Boolean) : [];
+    return Array.isArray(value)
+      ? value.filter((item) => item && typeof item.key === "string" && item.key)
+      : [];
   } catch {
     return [];
   }
@@ -32,9 +35,7 @@ const state = {
   expanded: new Set(),
   backups: [],
   page: 1,
-  pageSize: 50,
-  cookieWhitelist: loadWhitelist(),
-  whitelistInput: "",
+  itemWhitelist: loadWhitelist(),
   progress: null,
   conflicts: [],
   toast: "",
@@ -73,14 +74,9 @@ function selectedItems() {
 }
 
 function visibleItems() {
+  if (["restore", "whitelist"].includes(state.activeModule)) return [];
   if (state.activeModule === "all") return state.items;
   return state.items.filter((item) => item.module === state.activeModule);
-}
-
-function pageItems() {
-  const items = visibleItems();
-  const start = (state.page - 1) * state.pageSize;
-  return items.slice(start, start + state.pageSize);
 }
 
 function totals() {
@@ -127,13 +123,17 @@ async function runScan() {
         includeRegistry: true
       }
     });
-    state.items = result.items;
+    const allItems = result.items || [];
+    const hiddenCount = allItems.filter((item) => isWhitelisted(item)).length;
+    state.items = filterWhitelistedItems(allItems);
     state.activeModule = "all";
     state.page = 1;
     state.expanded = expandedTreeKeys();
     state.selected = new Set();
     state.errors = result.warnings || [];
-    showToast(`扫描完成：发现 ${result.items.length} 个可处理项目。`);
+    showToast(
+      `扫描完成：发现 ${state.items.length} 个可处理项目${hiddenCount ? `，白名单隐藏 ${hiddenCount} 项` : ""}。`
+    );
   } catch (error) {
     showToast(String(error));
   } finally {
@@ -150,50 +150,65 @@ async function relaunchAdmin() {
   }
 }
 
-function whitelistDomains() {
-  return state.cookieWhitelist;
-}
-
 function saveWhitelist() {
-  window.localStorage.setItem(whitelistStorageKey, JSON.stringify(state.cookieWhitelist));
+  window.localStorage.setItem(whitelistStorageKey, JSON.stringify(state.itemWhitelist));
 }
 
-function normalizeDomain(value) {
-  return value
-    .trim()
-    .toLowerCase()
-    .replace(/^https?:\/\//, "")
-    .replace(/^www\./, "")
-    .replace(/^\*\./, "")
-    .split(/[/?#]/)[0]
-    .split(":")[0]
-    .replace(/^\.+|\.+$/g, "");
+function whitelistKeySet() {
+  return new Set(state.itemWhitelist.map((item) => item.key));
 }
 
-function addWhitelistEntry(value) {
-  const domains = value
-    .split(/[,\n;]/)
-    .map(normalizeDomain)
-    .filter(Boolean);
-  if (!domains.length) return;
-  const merged = new Set(state.cookieWhitelist);
-  for (const domain of domains) {
-    merged.add(domain);
+function isWhitelisted(item) {
+  return whitelistKeySet().has(item.whitelistKey);
+}
+
+function filterWhitelistedItems(items) {
+  const keys = whitelistKeySet();
+  return items.filter((item) => !keys.has(item.whitelistKey));
+}
+
+function whitelistEntryFromItem(item) {
+  return {
+    key: item.whitelistKey,
+    module: item.module,
+    category: item.category || "其他",
+    name: item.name,
+    path: item.path,
+    risk: item.risk,
+    sizeBytes: item.sizeBytes || 0,
+    createdAt: String(Math.floor(Date.now() / 1000))
+  };
+}
+
+function addItemsToWhitelist(items) {
+  const addable = items.filter((item) => item?.whitelistKey);
+  if (!addable.length) return;
+  const merged = new Map(state.itemWhitelist.map((item) => [item.key, item]));
+  for (const item of addable) {
+    merged.set(item.whitelistKey, whitelistEntryFromItem(item));
+    state.selected.delete(item.id);
   }
-  state.cookieWhitelist = [...merged].sort();
-  state.whitelistInput = "";
+  state.itemWhitelist = [...merged.values()].sort((a, b) =>
+    `${moduleLabel(a.module)}${a.category}${a.name}`.localeCompare(
+      `${moduleLabel(b.module)}${b.category}${b.name}`,
+      "zh-Hans-CN"
+    )
+  );
+  state.items = filterWhitelistedItems(state.items);
   saveWhitelist();
+  showToast(`已加入白名单：${addable.length} 项。`);
   render();
 }
 
-function removeWhitelistEntry(domain) {
-  state.cookieWhitelist = state.cookieWhitelist.filter((item) => item !== domain);
+function removeWhitelistEntry(key) {
+  state.itemWhitelist = state.itemWhitelist.filter((item) => item.key !== key);
   saveWhitelist();
+  showToast("已从白名单移除，重新扫描后会再次显示。");
   render();
 }
 
 async function executeSelected(decisions = {}) {
-  const selectedIds = [...state.selected];
+  const selectedIds = selectedItems().map((item) => item.id);
   if (!selectedIds.length) {
     showToast("请先选择需要清理的项目。");
     return;
@@ -215,7 +230,8 @@ async function executeSelected(decisions = {}) {
       request: {
         selectedIds,
         conflictDecisions: decisions,
-        cookieWhitelist: whitelistDomains()
+        itemWhitelistKeys: [...whitelistKeySet()],
+        cookieWhitelist: []
       }
     });
     state.conflicts = [];
@@ -274,7 +290,7 @@ function groupKey(moduleId, category) {
 
 function treeGroups() {
   const modulesWithItems = modules
-    .filter((module) => !["all", "restore"].includes(module.id))
+    .filter((module) => !["all", "restore", "whitelist"].includes(module.id))
     .filter((module) => state.activeModule === "all" || module.id === state.activeModule)
     .map((module) => {
       const moduleItems = state.items.filter((item) => item.module === module.id);
@@ -327,9 +343,11 @@ function renderNav() {
       const count =
         module.id === "restore"
           ? state.backups.length
-          : module.id === "all"
-            ? state.items.length
-            : state.items.filter((item) => item.module === module.id).length;
+          : module.id === "whitelist"
+            ? state.itemWhitelist.length
+            : module.id === "all"
+              ? state.items.length
+              : state.items.filter((item) => item.module === module.id).length;
       return `
         <button class="${state.activeModule === module.id ? "active" : ""}" data-nav="${module.id}">
           <span>${module.label}</span>
@@ -364,35 +382,27 @@ function renderToolbar() {
     `;
   }
 
+  if (state.activeModule === "whitelist") {
+    return `
+      <div class="toolbar">
+        <div class="toolbar-group">
+          <button class="primary" data-action="scan" ${state.scanning ? "disabled" : ""}>扫描</button>
+          <button class="danger" data-action="clear-whitelist" ${state.itemWhitelist.length ? "" : "disabled"}>清空白名单</button>
+        </div>
+      </div>
+    `;
+  }
+
   return `
     <div class="toolbar">
       <div class="toolbar-group">
         <button class="primary" data-action="scan" ${state.scanning ? "disabled" : ""}>扫描</button>
         <button data-action="select-visible">全选当前视图</button>
         <button data-action="unselect-visible">取消当前视图</button>
+        <button data-action="whitelist-selected" ${state.selected.size ? "" : "disabled"}>加入白名单</button>
         <button class="danger" data-action="execute" ${state.executing || !state.selected.size ? "disabled" : ""}>执行清理</button>
       </div>
-      <div class="whitelist">
-        <label class="field">
-          Cookie 白名单
-          <input data-field="whitelistInput" value="${escapeHtml(state.whitelistInput)}" placeholder="example.com" />
-        </label>
-        <button data-action="add-whitelist">添加</button>
-        <div class="whitelist-tags">
-          ${
-            state.cookieWhitelist.length
-              ? state.cookieWhitelist
-                  .map(
-                    (domain) => `
-                      <button class="tag" data-remove-whitelist="${escapeHtml(domain)}" title="移除 ${escapeHtml(domain)}">
-                        ${escapeHtml(domain)} ×
-                      </button>`
-                  )
-                  .join("")
-              : `<span class="muted">未设置</span>`
-          }
-        </div>
-      </div>
+      <div class="toolbar-note">白名单项会从本次结果移除，并在下次扫描隐藏。</div>
     </div>
   `;
 }
@@ -499,11 +509,14 @@ function renderTreeItem(moduleId, category, item) {
         <span class="path" title="${escapeHtml(item.path)}">${escapeHtml(item.path)}</span>
         <span>${formatBytes(item.sizeBytes)}</span>
         <span class="risk ${item.risk}">${riskLabel(item.risk)}</span>
-        ${
-          item.children.length
-            ? `<button data-expand="${item.id}">${expanded ? "收起" : "展开"} ${item.children.length}</button>`
-            : "<span></span>"
-        }
+        <span class="row-actions">
+          ${
+            item.children.length
+              ? `<button data-expand="${item.id}">${expanded ? "收起" : "展开"} ${item.children.length}</button>`
+              : ""
+          }
+          <button data-whitelist-item="${item.id}">白名单</button>
+        </span>
       </div>
       ${children}
     </div>
@@ -525,6 +538,33 @@ function renderBackups() {
               <span>${escapeHtml(backup.createdAt)}</span>
               <span>${formatBytes(backup.sizeBytes)}</span>
               <button data-restore="${escapeHtml(backup.path)}">恢复</button>
+            </div>
+          `
+        )
+        .join("")}
+    </div>
+  `;
+}
+
+function renderWhitelistPage() {
+  if (!state.itemWhitelist.length) {
+    return `<div class="panel"><div class="empty">暂无白名单项目</div></div>`;
+  }
+
+  return `
+    <div class="panel whitelist-list">
+      ${state.itemWhitelist
+        .map(
+          (entry) => `
+            <div class="whitelist-row">
+              <span>${moduleLabel(entry.module)}</span>
+              <span>${escapeHtml(entry.category || "其他")}</span>
+              <span class="name">
+                <strong title="${escapeHtml(entry.name)}">${escapeHtml(entry.name)}</strong>
+                <small title="${escapeHtml(entry.path)}">${escapeHtml(entry.path)}</small>
+              </span>
+              <span class="risk ${entry.risk}">${riskLabel(entry.risk)}</span>
+              <button data-remove-whitelist="${escapeHtml(entry.key)}">移除</button>
             </div>
           `
         )
@@ -605,6 +645,7 @@ function render() {
   const data = totals();
   const env = state.env;
   const isRestore = state.activeModule === "restore";
+  const isWhitelist = state.activeModule === "whitelist";
   app.innerHTML = `
     <div class="shell">
       <aside class="sidebar">
@@ -621,17 +662,23 @@ function render() {
       <main class="main">
         <div class="topbar">
           <div class="title">
-            <h2>${isRestore ? "恢复中心" : "扫描与清理"}</h2>
-            <p>${isRestore ? "查看并导入历史注册表备份。" : `当前预计释放 ${formatBytes(data.selectedSize)}。`}</p>
+            <h2>${isRestore ? "恢复中心" : isWhitelist ? "白名单" : "扫描与清理"}</h2>
+            <p>${
+              isRestore
+                ? "查看并导入历史注册表备份。"
+                : isWhitelist
+                  ? "这些项目会从扫描结果中隐藏，执行清理时自动跳过。"
+                  : `当前预计释放 ${formatBytes(data.selectedSize)}。`
+            }</p>
           </div>
           <div class="status-row">
             <span class="badge ${env?.isAdmin ? "safe" : "warn"}">${env?.isAdmin ? "管理员权限" : "普通权限"}</span>
             ${env && !env.isAdmin ? `<button data-action="admin">以管理员身份重启</button>` : ""}
           </div>
         </div>
-        ${renderSummary()}
+        ${isRestore || isWhitelist ? "" : renderSummary()}
         ${renderToolbar()}
-        ${isRestore ? renderBackups() : renderItems()}
+        ${isRestore ? renderBackups() : isWhitelist ? renderWhitelistPage() : renderItems()}
         ${renderWarnings()}
       </main>
     </div>
@@ -693,6 +740,13 @@ app.addEventListener("click", async (event) => {
     return;
   }
 
+  const whitelistItem = target.dataset.whitelistItem;
+  if (whitelistItem) {
+    const item = state.items.find((entry) => entry.id === whitelistItem);
+    if (item) addItemsToWhitelist([item]);
+    return;
+  }
+
   const removeWhitelist = target.dataset.removeWhitelist;
   if (removeWhitelist) {
     removeWhitelistEntry(removeWhitelist);
@@ -701,19 +755,18 @@ app.addEventListener("click", async (event) => {
 
   const action = target.dataset.action;
   if (action === "scan") await runScan();
-  if (action === "add-whitelist") addWhitelistEntry(state.whitelistInput);
   if (action === "execute") await executeSelected();
+  if (action === "whitelist-selected") addItemsToWhitelist(selectedItems());
+  if (action === "clear-whitelist") {
+    if (window.confirm("确认清空白名单？")) {
+      state.itemWhitelist = [];
+      saveWhitelist();
+      showToast("白名单已清空，重新扫描后恢复显示。");
+      render();
+    }
+  }
   if (action === "select-visible") toggleAllVisible(true);
   if (action === "unselect-visible") toggleAllVisible(false);
-  if (action === "prev-page" && state.page > 1) {
-    state.page -= 1;
-    render();
-  }
-  if (action === "next-page") {
-    const pages = Math.max(1, Math.ceil(visibleItems().length / state.pageSize));
-    if (state.page < pages) state.page += 1;
-    render();
-  }
   if (action === "reload-backups") await loadBackups();
   if (action === "admin") await relaunchAdmin();
   if (action === "kill-conflicts") {
@@ -723,19 +776,6 @@ app.addEventListener("click", async (event) => {
   if (action === "skip-conflicts") {
     const decisions = Object.fromEntries(state.conflicts.map((item) => [item.itemId, "skip"]));
     await executeSelected(decisions);
-  }
-});
-
-app.addEventListener("input", (event) => {
-  if (event.target.dataset.field === "whitelistInput") {
-    state.whitelistInput = event.target.value;
-  }
-});
-
-app.addEventListener("keydown", (event) => {
-  if (event.target.dataset.field === "whitelistInput" && event.key === "Enter") {
-    event.preventDefault();
-    addWhitelistEntry(state.whitelistInput);
   }
 });
 

@@ -71,6 +71,7 @@ struct FilePreview {
 #[serde(rename_all = "camelCase")]
 struct CleanerItem {
     id: String,
+    whitelist_key: String,
     module: ModuleKind,
     category: String,
     name: String,
@@ -172,6 +173,7 @@ struct ProcessConflict {
 struct ExecuteCleanRequest {
     selected_ids: Vec<String>,
     conflict_decisions: HashMap<String, ConflictDecision>,
+    item_whitelist_keys: Vec<String>,
     cookie_whitelist: Vec<String>,
 }
 
@@ -309,9 +311,24 @@ fn execute_clean(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<CleanSummary, String> {
-    let items = selected_scanned_items(&state, &request.selected_ids)?;
+    let mut items = selected_scanned_items(&state, &request.selected_ids)?;
     if items.is_empty() {
         return Err("没有可执行的清理项目".to_string());
+    }
+    let original_count = items.len();
+    let item_whitelist_keys = request.item_whitelist_keys.iter().collect::<HashSet<_>>();
+    if !item_whitelist_keys.is_empty() {
+        items.retain(|item| !item_whitelist_keys.contains(&item.public.whitelist_key));
+    }
+    if items.is_empty() {
+        return Ok(CleanSummary {
+            requested_count: original_count,
+            cleaned_count: 0,
+            skipped_count: original_count,
+            freed_bytes: 0,
+            backup_created: None,
+            errors: Vec::new(),
+        });
     }
 
     for conflict in conflicts_for_items(&items) {
@@ -472,8 +489,10 @@ fn make_item(
     process_names: Vec<String>,
     children: Vec<FilePreview>,
 ) -> CleanerItem {
+    let whitelist_key = item_whitelist_key(&module, category, name, &path);
     CleanerItem {
         id: String::new(),
+        whitelist_key,
         module,
         category: category.to_string(),
         name: name.to_string(),
@@ -485,6 +504,35 @@ fn make_item(
         process_names,
         children,
     }
+}
+
+fn item_whitelist_key(module: &ModuleKind, category: &str, name: &str, path: &str) -> String {
+    format!(
+        "v1|{}|{}|{}|{}",
+        module_kind_key(module),
+        normalize_whitelist_part(category),
+        normalize_whitelist_part(name),
+        normalize_whitelist_part(path)
+    )
+}
+
+fn module_kind_key(module: &ModuleKind) -> &'static str {
+    match module {
+        ModuleKind::System => "system",
+        ModuleKind::Browser => "browser",
+        ModuleKind::Application => "application",
+        ModuleKind::Registry => "registry",
+    }
+}
+
+fn normalize_whitelist_part(value: &str) -> String {
+    value
+        .trim()
+        .replace('\\', "/")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 fn selected_scanned_items(

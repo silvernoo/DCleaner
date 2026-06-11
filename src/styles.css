@@ -233,54 +233,17 @@ input[type="checkbox"] {
   gap: 8px;
 }
 
-.field {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--muted);
-  font-size: 13px;
-}
-
-.field input {
-  width: 220px;
-  height: 34px;
-  border: 1px solid var(--border-strong);
-  border-radius: 6px;
-  padding: 0 10px;
-}
-
-.whitelist {
-  display: grid;
-  grid-template-columns: auto auto;
-  align-items: start;
-  gap: 8px;
-  max-width: 430px;
-}
-
-.whitelist-tags {
-  grid-column: 1 / -1;
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 6px;
-  min-height: 24px;
-}
-
-.tag {
-  min-height: 24px;
-  max-width: 170px;
-  overflow: hidden;
-  border-color: #b7d6d1;
-  background: #ecfdf9;
-  color: var(--accent-strong);
-  padding: 0 8px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .muted {
   color: var(--muted);
   font-size: 12px;
+}
+
+.toolbar-note {
+  max-width: 360px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+  text-align: right;
 }
 
 .summary-grid {
@@ -360,7 +323,7 @@ input[type="checkbox"] {
 }
 
 .leaf-row {
-  grid-template-columns: 28px 26px minmax(190px, 1.2fr) minmax(220px, 1.6fr) 94px 82px 78px;
+  grid-template-columns: 28px 26px minmax(190px, 1.2fr) minmax(220px, 1.6fr) 94px 82px 132px;
   border-top: 1px solid #edf1f6;
   padding-left: 52px;
 }
@@ -497,13 +460,17 @@ input[type="checkbox"] {
   font-size: 12px;
 }
 
-.row-action {
+.row-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
   min-width: 0;
 }
 
-.row-action button {
-  width: 100%;
+.row-actions button {
+  min-height: 28px;
   padding: 0 8px;
+  font-size: 12px;
 }
 
 .child-line {
@@ -551,6 +518,41 @@ input[type="checkbox"] {
 
 .backup-row:last-child {
   border-bottom: 0;
+}
+
+.whitelist-list {
+  display: grid;
+}
+
+.whitelist-row {
+  display: grid;
+  grid-template-columns: 110px 150px minmax(280px, 1fr) 90px 92px;
+  align-items: center;
+  gap: 12px;
+  min-height: 58px;
+  padding: 0 14px;
+  border-bottom: 1px solid #edf1f6;
+  font-size: 13px;
+}
+
+.whitelist-row:last-child {
+  border-bottom: 0;
+}
+
+.whitelist-row .name {
+  min-width: 0;
+}
+
+.whitelist-row strong,
+.whitelist-row small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.whitelist-row small {
+  color: var(--muted);
 }
 
 .modal-cover {
