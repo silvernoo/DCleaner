@@ -111,6 +111,9 @@ button {
   background: var(--surface-strong);
   color: var(--text);
   cursor: default;
+  line-height: 1;
+  text-align: center;
+  white-space: nowrap;
   transition:
     background-color 0.12s ease,
     border-color 0.12s ease,
@@ -390,7 +393,7 @@ kbd {
 
 .sidebar {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr);
   min-height: 0;
   overflow: hidden;
   border-right: 1px solid var(--sidebar-line);
@@ -480,29 +483,6 @@ kbd {
   text-align: center;
 }
 
-.sidebar-footer {
-  display: grid;
-  gap: 5px;
-  min-width: 0;
-  border-top: 1px solid var(--sidebar-line);
-  padding: 12px 16px 14px;
-}
-
-.sidebar-footer span {
-  color: rgba(255, 255, 255, 0.48);
-  font-size: 11px;
-}
-
-.sidebar-footer strong {
-  min-width: 0;
-  overflow: hidden;
-  color: rgba(255, 255, 255, 0.76);
-  font-size: 11px;
-  font-weight: 500;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .main {
   min-height: 0;
   overflow-y: auto;
@@ -584,13 +564,6 @@ kbd {
 
 .command-button {
   min-width: 82px;
-}
-
-.command-trigger {
-  gap: 5px;
-  border-color: var(--line);
-  background: var(--surface);
-  color: var(--muted-strong);
 }
 
 .icon-button {
@@ -873,8 +846,7 @@ kbd {
   white-space: nowrap;
 }
 
-.modal-cover,
-.command-cover {
+.modal-cover {
   position: fixed;
   inset: 0;
   z-index: 20;
@@ -967,74 +939,6 @@ kbd {
 
 .log-list li {
   padding: 3px 0;
-}
-
-.command-panel {
-  width: min(560px, calc(100vw - 48px));
-  overflow: hidden;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: var(--surface-strong);
-  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.3);
-}
-
-.command-input {
-  width: 100%;
-  height: 48px;
-  border: 0;
-  border-bottom: 1px solid var(--line);
-  outline: 0;
-  padding: 0 16px;
-  background: transparent;
-  color: var(--text);
-  font-size: 15px;
-}
-
-.command-list {
-  display: grid;
-  gap: 2px;
-  max-height: min(420px, calc(100vh - 160px));
-  overflow: auto;
-  padding: 8px;
-}
-
-.command-row {
-  display: grid;
-  justify-content: stretch;
-  justify-items: start;
-  min-height: 46px;
-  border-color: transparent;
-  background: transparent;
-  text-align: left;
-}
-
-.command-row.active,
-.command-row:hover:not(:disabled) {
-  background: var(--accent-soft);
-}
-
-.command-row span,
-.command-row small {
-  overflow: hidden;
-  max-width: 100%;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.command-row span {
-  font-weight: 700;
-}
-
-.command-row small {
-  color: var(--muted);
-  font-size: 11px;
-}
-
-.command-empty {
-  padding: 28px 12px;
-  color: var(--muted);
-  font-size: 13px;
-  text-align: center;
 }
 
 .context-menu {

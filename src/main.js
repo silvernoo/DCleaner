@@ -43,8 +43,6 @@ const state = {
   conflicts: [],
   toast: "",
   errors: [],
-  commandOpen: false,
-  commandQuery: "",
   contextMenu: null
 };
 
@@ -148,8 +146,6 @@ async function nativeConfirm(message, title = "DCleaner") {
 }
 
 function closeOverlays() {
-  state.commandOpen = false;
-  state.commandQuery = "";
   state.contextMenu = null;
 }
 
@@ -446,7 +442,6 @@ function toggleItems(items, checked) {
 }
 
 async function runAction(action, payload = {}) {
-  const wasCommandOpen = state.commandOpen;
   closeOverlays();
   if (action === "scan") await runScan();
   if (action === "execute") await executeSelected();
@@ -475,21 +470,6 @@ async function runAction(action, payload = {}) {
     state.activeModule = "restore";
     await loadBackups();
     render();
-  }
-  if (action === "toggle-command") {
-    state.commandOpen = !wasCommandOpen;
-    state.commandQuery = "";
-    render({ preserveScroll: true });
-  }
-  if (action === "open-command") {
-    state.commandOpen = true;
-    state.commandQuery = "";
-    render({ preserveScroll: true });
-  }
-  if (action === "close-command") {
-    state.commandOpen = false;
-    state.commandQuery = "";
-    render({ preserveScroll: true });
   }
   if (action === "whitelist-item" && payload.itemId) {
     const item = itemById(payload.itemId);
@@ -568,7 +548,6 @@ function renderToolbar() {
         <button data-action="whitelist-selected" ${state.selected.size ? "" : "disabled"}>白名单</button>
         <button class="danger command-button" data-action="execute" ${state.executing || !state.selected.size ? "disabled" : ""}>清理</button>
       </div>
-      <button class="command-trigger" data-action="open-command">命令 <kbd>Ctrl</kbd><kbd>K</kbd></button>
     </div>
   `;
 }
@@ -784,96 +763,6 @@ function renderWhitelistPage() {
   `;
 }
 
-function commandItems() {
-  return [
-    {
-      id: "scan",
-      title: "开始扫描",
-      meta: "扫描系统、浏览器、应用和注册表",
-      action: "scan",
-      disabled: state.scanning
-    },
-    {
-      id: "execute",
-      title: "执行清理",
-      meta: `${state.selected.size} 项已选择`,
-      action: "execute",
-      disabled: state.executing || !state.selected.size
-    },
-    {
-      id: "select-visible",
-      title: "全选当前视图",
-      meta: `${visibleItems().length} 项可选`,
-      action: "select-visible",
-      disabled: !visibleItems().length
-    },
-    {
-      id: "unselect-visible",
-      title: "取消当前视图选择",
-      meta: "保留其他页面选择状态",
-      action: "unselect-visible",
-      disabled: !visibleItems().length
-    },
-    {
-      id: "whitelist-selected",
-      title: "加入白名单",
-      meta: "隐藏选中的项目",
-      action: "whitelist-selected",
-      disabled: !state.selected.size
-    },
-    {
-      id: "show-whitelist",
-      title: "打开白名单",
-      meta: `${state.itemWhitelist.length} 项`,
-      action: "show-whitelist"
-    },
-    {
-      id: "show-restore",
-      title: "打开恢复中心",
-      meta: `${state.backups.length} 个备份`,
-      action: "show-restore"
-    }
-  ];
-}
-
-function filteredCommandItems() {
-  const query = state.commandQuery.trim().toLocaleLowerCase("zh-Hans-CN");
-  const items = commandItems();
-  if (!query) return items;
-  return items.filter((item) =>
-    `${item.title} ${item.meta}`.toLocaleLowerCase("zh-Hans-CN").includes(query)
-  );
-}
-
-function renderCommandPalette() {
-  if (!state.commandOpen) return "";
-  return `
-    <div class="command-cover" data-action="close-command">
-      <section class="command-panel" role="dialog" aria-modal="true" aria-label="命令面板">
-        <input class="command-input" data-command-input placeholder="搜索命令" value="${escapeHtml(state.commandQuery)}" autocomplete="off" />
-        <div class="command-list">
-          ${renderCommandRows()}
-        </div>
-      </section>
-    </div>
-  `;
-}
-
-function renderCommandRows() {
-  const items = filteredCommandItems();
-  return items.length
-    ? items
-        .map(
-          (item, index) => `
-            <button class="command-row ${index === 0 ? "active" : ""}" data-command-action="${item.action}" ${item.disabled ? "disabled" : ""}>
-              <span>${escapeHtml(item.title)}</span>
-              <small>${escapeHtml(item.meta)}</small>
-            </button>`
-        )
-        .join("")
-    : `<div class="command-empty">没有匹配命令</div>`;
-}
-
 function renderContextMenu() {
   if (!state.contextMenu) return "";
   const item = itemById(state.contextMenu.itemId);
@@ -989,10 +878,6 @@ function render(options = {}) {
             </div>
           </div>
           <nav class="nav">${renderNav()}</nav>
-          <div class="sidebar-footer">
-            <span>备份目录</span>
-            <strong title="${escapeHtml(env?.backupDir || "")}">${escapeHtml(env?.backupDir || "加载中")}</strong>
-          </div>
         </aside>
         <main class="main">
           <div class="topbar">
@@ -1021,12 +906,10 @@ function render(options = {}) {
       </div>
     </div>
     ${renderModal()}
-    ${renderCommandPalette()}
     ${renderContextMenu()}
     ${state.toast ? `<div class="toast">${escapeHtml(state.toast)}</div>` : ""}
   `;
   syncPartialCheckboxes();
-  if (state.commandOpen) app.querySelector("[data-command-input]")?.focus();
   if (options.preserveScroll) {
     const main = app.querySelector(".main");
     if (main) {
@@ -1037,12 +920,6 @@ function render(options = {}) {
 }
 
 app.addEventListener("click", async (event) => {
-  const commandPanel = event.target.closest(".command-panel");
-  if (state.commandOpen && !commandPanel && event.target.dataset.action === "close-command") {
-    await runAction("close-command");
-    return;
-  }
-
   if (state.contextMenu && !event.target.closest(".context-menu")) {
     state.contextMenu = null;
     render({ preserveScroll: true });
@@ -1101,12 +978,6 @@ app.addEventListener("click", async (event) => {
     return;
   }
 
-  const commandAction = target.dataset.commandAction;
-  if (commandAction) {
-    await runAction(commandAction);
-    return;
-  }
-
   const nav = target.dataset.nav;
   if (nav) {
     closeOverlays();
@@ -1156,35 +1027,11 @@ app.addEventListener("click", async (event) => {
   }
 });
 
-app.addEventListener("input", (event) => {
-  if (event.target.matches("[data-command-input]")) {
-    state.commandQuery = event.target.value;
-    const list = app.querySelector(".command-list");
-    if (list) list.innerHTML = renderCommandRows();
-  }
-});
-
-app.addEventListener("keydown", async (event) => {
-  if (!state.commandOpen) return;
-  if (event.key === "Enter") {
-    const first = filteredCommandItems().find((item) => !item.disabled);
-    if (first) await runAction(first.action);
-    return;
-  }
-  if (event.key === "Escape") {
-    await runAction("close-command");
-  }
-});
-
 document.addEventListener("keydown", async (event) => {
   const activeTag = document.activeElement?.tagName?.toLowerCase();
   const isTextInput = ["input", "textarea"].includes(activeTag);
   if ((event.ctrlKey || event.metaKey) && ["+", "-", "=", "0"].includes(event.key)) {
     event.preventDefault();
-  }
-  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
-    event.preventDefault();
-    await runAction("toggle-command");
   }
   if (event.key === "Escape") {
     if (state.contextMenu) {
@@ -1192,7 +1039,6 @@ document.addEventListener("keydown", async (event) => {
       render({ preserveScroll: true });
       return;
     }
-    if (state.commandOpen) await runAction("close-command");
   }
   if (!isTextInput && event.key.toLowerCase() === "f5") {
     event.preventDefault();
