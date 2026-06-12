@@ -6,6 +6,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tauri::menu::MenuBuilder;
+use tauri::tray::TrayIconBuilder;
 use tauri::{Emitter, Manager};
 use walkdir::WalkDir;
 
@@ -28,6 +30,10 @@ use windows::Win32::UI::Shell::{
 };
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+#[cfg(windows)]
+use windows::Win32::UI::WindowsAndMessaging::{
+    IDOK, MB_ICONQUESTION, MB_OKCANCEL, MB_SETFOREGROUND, MessageBoxW,
+};
 
 #[cfg(not(windows))]
 compile_error!("DCleaner only supports Windows targets.");
@@ -156,6 +162,7 @@ struct ScanResponse {
 struct EnvInfo {
     is_admin: bool,
     backup_dir: String,
+    platform: String,
 }
 
 #[derive(Serialize)]
@@ -230,6 +237,10 @@ struct ActionOutcome {
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
+        .setup(|app| {
+            setup_tray(app)?;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_environment,
             scan_all,
@@ -237,10 +248,62 @@ pub fn run() {
             execute_clean,
             list_backups,
             restore_backup,
-            relaunch_as_admin
+            relaunch_as_admin,
+            confirm_native
         ])
         .run(tauri::generate_context!())
         .expect("failed to run DCleaner");
+}
+
+fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
+    let menu = MenuBuilder::new(app)
+        .text("show", "显示 DCleaner")
+        .text("hide", "隐藏窗口")
+        .separator()
+        .text("quit", "退出")
+        .build()?;
+    let icon = app.default_window_icon().cloned();
+
+    let mut builder = TrayIconBuilder::with_id("main")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .tooltip("DCleaner")
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "show" => show_main_window(app),
+            "hide" => {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+            }
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if matches!(
+                event,
+                tauri::tray::TrayIconEvent::Click {
+                    button: tauri::tray::MouseButton::Left,
+                    button_state: tauri::tray::MouseButtonState::Up,
+                    ..
+                }
+            ) {
+                show_main_window(tray.app_handle());
+            }
+        });
+
+    if let Some(icon) = icon {
+        builder = builder.icon(icon);
+    }
+
+    builder.build(app)?;
+    Ok(())
+}
+
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
 }
 
 #[tauri::command]
@@ -248,6 +311,7 @@ fn get_environment(app: tauri::AppHandle) -> EnvInfo {
     EnvInfo {
         is_admin: is_admin(),
         backup_dir: backup_dir(&app).display().to_string(),
+        platform: std::env::consts::OS.to_string(),
     }
 }
 
@@ -464,6 +528,21 @@ fn relaunch_as_admin(app: tauri::AppHandle) -> Result<(), String> {
     shell_execute("runas", &exe.display().to_string(), None)?;
     app.exit(0);
     Ok(())
+}
+
+#[tauri::command]
+fn confirm_native(title: String, message: String) -> Result<bool, String> {
+    let title = to_wide_null(&title);
+    let message = to_wide_null(&message);
+    let result = unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(message.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OKCANCEL | MB_ICONQUESTION | MB_SETFOREGROUND,
+        )
+    };
+    Ok(result == IDOK)
 }
 
 fn push_item(

@@ -3,5 +3,12 @@
   "identifier": "default",
   "description": "Default DCleaner permissions",
   "windows": ["main"],
-  "permissions": ["core:default", "core:event:default", "core:window:default"]
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:window:default",
+    "core:window:allow-close",
+    "core:window:allow-minimize",
+    "core:window:allow-start-dragging"
+  ]
 }

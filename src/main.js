@@ -1,18 +1,21 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import "./styles.css";
 
 const modules = [
-  { id: "all", label: "全部" },
-  { id: "system", label: "系统清理" },
-  { id: "browser", label: "浏览器" },
-  { id: "application", label: "第三方应用" },
-  { id: "registry", label: "注册表" },
-  { id: "whitelist", label: "白名单" },
-  { id: "restore", label: "恢复中心" }
+  { id: "all", label: "总览", icon: "⌘" },
+  { id: "system", label: "系统", icon: "▣" },
+  { id: "browser", label: "浏览器", icon: "◎" },
+  { id: "application", label: "应用", icon: "◫" },
+  { id: "registry", label: "注册表", icon: "▧" },
+  { id: "whitelist", label: "白名单", icon: "✓" },
+  { id: "restore", label: "恢复", icon: "↺" }
 ];
 
 const whitelistStorageKey = "dcleaner.itemWhitelist";
+const inTauri = isTauri();
+const appWindow = inTauri ? getCurrentWindow() : null;
 
 function loadWhitelist() {
   try {
@@ -39,10 +42,45 @@ const state = {
   progress: null,
   conflicts: [],
   toast: "",
-  errors: []
+  errors: [],
+  commandOpen: false,
+  commandQuery: "",
+  contextMenu: null
 };
 
 const app = document.querySelector("#app");
+
+document.addEventListener("contextmenu", (event) => {
+  event.preventDefault();
+  const itemElement = event.target.closest("[data-item-row]");
+  if (itemElement) {
+    state.contextMenu = {
+      x: event.clientX,
+      y: event.clientY,
+      itemId: itemElement.dataset.itemRow
+    };
+    render({ preserveScroll: true });
+    return;
+  }
+  state.contextMenu = null;
+  render({ preserveScroll: true });
+});
+
+document.addEventListener("dragstart", (event) => event.preventDefault());
+
+app.addEventListener("mousedown", async (event) => {
+  const target = event.target instanceof Element ? event.target : null;
+  if (event.button !== 0 || !target?.closest("[data-window-drag]")) return;
+  await appWindow?.startDragging();
+});
+
+document.addEventListener(
+  "wheel",
+  (event) => {
+    if (event.ctrlKey) event.preventDefault();
+  },
+  { passive: false }
+);
 
 function moduleLabel(moduleId) {
   const found = modules.find((item) => item.id === moduleId);
@@ -91,6 +129,7 @@ function totals() {
 
 function showToast(message) {
   state.toast = message;
+  state.contextMenu = null;
   render({ preserveScroll: true });
   window.clearTimeout(showToast.timer);
   showToast.timer = window.setTimeout(() => {
@@ -99,13 +138,82 @@ function showToast(message) {
   }, 3600);
 }
 
+async function nativeConfirm(message, title = "DCleaner") {
+  try {
+    return await callCommand("confirm_native", { title, message });
+  } catch (error) {
+    showToast(String(error));
+    return false;
+  }
+}
+
+function closeOverlays() {
+  state.commandOpen = false;
+  state.commandQuery = "";
+  state.contextMenu = null;
+}
+
+function currentModule() {
+  return modules.find((module) => module.id === state.activeModule) || modules[0];
+}
+
+function itemById(id) {
+  return state.items.find((item) => item.id === id);
+}
+
+async function callCommand(command, args = {}) {
+  if (inTauri) return invoke(command, args);
+  if (command === "get_environment") {
+    return {
+      isAdmin: false,
+      backupDir: "Tauri 预览模式",
+      platform: browserPlatform()
+    };
+  }
+  if (command === "list_backups") return [];
+  if (command === "scan_all") {
+    return {
+      isAdmin: false,
+      items: [],
+      totalSizeBytes: 0,
+      warnings: ["浏览器预览模式不会执行真实扫描。"]
+    };
+  }
+  if (command === "confirm_native") return true;
+  if (command === "detect_conflicts") return [];
+  if (command === "execute_clean") {
+    return {
+      requestedCount: 0,
+      cleanedCount: 0,
+      skippedCount: 0,
+      freedBytes: 0,
+      backupCreated: null,
+      errors: []
+    };
+  }
+  return null;
+}
+
+function browserPlatform() {
+  const value = `${navigator.userAgent} ${navigator.platform}`.toLowerCase();
+  if (value.includes("mac")) return "macos";
+  if (value.includes("win")) return "windows";
+  return "linux";
+}
+
+function platformStyle(platform) {
+  if (platform === "macos") return "macos";
+  if (platform === "linux") return "linux";
+  return "windows";
+}
+
 async function loadEnvironment() {
-  state.env = await invoke("get_environment");
+  state.env = await callCommand("get_environment");
   render({ preserveScroll: true });
 }
 
 async function loadBackups() {
-  state.backups = await invoke("list_backups");
+  state.backups = await callCommand("list_backups");
   render({ preserveScroll: true });
 }
 
@@ -115,7 +223,7 @@ async function runScan() {
   state.errors = [];
   render();
   try {
-    const result = await invoke("scan_all", {
+    const result = await callCommand("scan_all", {
       options: {
         includeSystem: true,
         includeBrowsers: true,
@@ -144,7 +252,7 @@ async function runScan() {
 
 async function relaunchAdmin() {
   try {
-    await invoke("relaunch_as_admin");
+    await callCommand("relaunch_as_admin");
   } catch (error) {
     showToast(String(error));
   }
@@ -226,7 +334,7 @@ async function executeSelected(decisions = {}) {
   render();
 
   try {
-    const summary = await invoke("execute_clean", {
+    const summary = await callCommand("execute_clean", {
       request: {
         selectedIds,
         conflictDecisions: decisions,
@@ -253,7 +361,7 @@ async function executeSelected(decisions = {}) {
 
 async function openConflictModal() {
   try {
-    state.conflicts = await invoke("detect_conflicts", {
+    state.conflicts = await callCommand("detect_conflicts", {
       itemIds: [...state.selected]
     });
     if (!state.conflicts.length) {
@@ -267,9 +375,9 @@ async function openConflictModal() {
 }
 
 async function restoreBackup(path) {
-  if (!window.confirm("确认导入该注册表备份？")) return;
+  if (!(await nativeConfirm("确认导入该注册表备份？", "恢复注册表备份"))) return;
   try {
-    const result = await invoke("restore_backup", { path });
+    const result = await callCommand("restore_backup", { path });
     showToast(result.message);
   } catch (error) {
     showToast(String(error));
@@ -337,6 +445,63 @@ function toggleItems(items, checked) {
   render({ preserveScroll: true });
 }
 
+async function runAction(action, payload = {}) {
+  const wasCommandOpen = state.commandOpen;
+  closeOverlays();
+  if (action === "scan") await runScan();
+  if (action === "execute") await executeSelected();
+  if (action === "whitelist-selected") addItemsToWhitelist(selectedItems());
+  if (action === "clear-whitelist") {
+    if (await nativeConfirm("确认清空白名单？", "清空白名单")) {
+      state.itemWhitelist = [];
+      saveWhitelist();
+      showToast("白名单已清空，重新扫描后恢复显示。");
+      render({ preserveScroll: true });
+    }
+  }
+  if (action === "select-visible") toggleAllVisible(true);
+  if (action === "unselect-visible") toggleAllVisible(false);
+  if (action === "reload-backups") await loadBackups();
+  if (action === "admin") await relaunchAdmin();
+  if (action === "show-all") {
+    state.activeModule = "all";
+    render();
+  }
+  if (action === "show-whitelist") {
+    state.activeModule = "whitelist";
+    render();
+  }
+  if (action === "show-restore") {
+    state.activeModule = "restore";
+    await loadBackups();
+    render();
+  }
+  if (action === "toggle-command") {
+    state.commandOpen = !wasCommandOpen;
+    state.commandQuery = "";
+    render({ preserveScroll: true });
+  }
+  if (action === "open-command") {
+    state.commandOpen = true;
+    state.commandQuery = "";
+    render({ preserveScroll: true });
+  }
+  if (action === "close-command") {
+    state.commandOpen = false;
+    state.commandQuery = "";
+    render({ preserveScroll: true });
+  }
+  if (action === "whitelist-item" && payload.itemId) {
+    const item = itemById(payload.itemId);
+    if (item) addItemsToWhitelist([item]);
+  }
+  if (action === "toggle-item" && payload.itemId) {
+    if (state.expanded.has(payload.itemId)) state.expanded.delete(payload.itemId);
+    else state.expanded.add(payload.itemId);
+    render({ preserveScroll: true });
+  }
+}
+
 function renderNav() {
   return modules
     .map((module) => {
@@ -349,8 +514,9 @@ function renderNav() {
               ? state.items.length
               : state.items.filter((item) => item.module === module.id).length;
       return `
-        <button class="${state.activeModule === module.id ? "active" : ""}" data-nav="${module.id}">
-          <span>${module.label}</span>
+        <button class="nav-item ${state.activeModule === module.id ? "active" : ""}" data-nav="${module.id}">
+          <span class="nav-icon">${module.icon}</span>
+          <span class="nav-label">${module.label}</span>
           <span class="count">${count}</span>
         </button>
       `;
@@ -362,10 +528,10 @@ function renderSummary() {
   const data = totals();
   return `
     <div class="summary-grid">
-      <div class="metric"><span>发现项目</span><strong>${data.allCount}</strong></div>
-      <div class="metric"><span>已选择</span><strong>${data.selectedCount}</strong></div>
-      <div class="metric"><span>可清理空间</span><strong>${formatBytes(data.totalSize)}</strong></div>
-      <div class="metric"><span>预计释放</span><strong>${formatBytes(data.selectedSize)}</strong></div>
+      <div class="metric"><span>发现</span><strong>${data.allCount}</strong></div>
+      <div class="metric"><span>选中</span><strong>${data.selectedCount}</strong></div>
+      <div class="metric"><span>可清理</span><strong>${formatBytes(data.totalSize)}</strong></div>
+      <div class="metric accent"><span>预计释放</span><strong>${formatBytes(data.selectedSize)}</strong></div>
     </div>
   `;
 }
@@ -376,7 +542,7 @@ function renderToolbar() {
     return `
       <div class="toolbar">
         <div class="toolbar-group">
-          <button data-action="reload-backups">刷新备份</button>
+          <button class="icon-button" data-action="reload-backups" title="刷新备份">↻</button>
         </div>
       </div>
     `;
@@ -386,7 +552,7 @@ function renderToolbar() {
     return `
       <div class="toolbar">
         <div class="toolbar-group">
-          <button class="primary" data-action="scan" ${state.scanning ? "disabled" : ""}>扫描</button>
+          <button class="primary command-button" data-action="scan" ${state.scanning ? "disabled" : ""}>开始扫描</button>
           <button class="danger" data-action="clear-whitelist" ${state.itemWhitelist.length ? "" : "disabled"}>清空白名单</button>
         </div>
       </div>
@@ -396,13 +562,46 @@ function renderToolbar() {
   return `
     <div class="toolbar">
       <div class="toolbar-group">
-        <button class="primary" data-action="scan" ${state.scanning ? "disabled" : ""}>扫描</button>
-        <button data-action="select-visible">全选当前视图</button>
-        <button data-action="unselect-visible">取消当前视图</button>
-        <button data-action="whitelist-selected" ${state.selected.size ? "" : "disabled"}>加入白名单</button>
-        <button class="danger" data-action="execute" ${state.executing || !state.selected.size ? "disabled" : ""}>执行清理</button>
+        <button class="primary command-button" data-action="scan" ${state.scanning ? "disabled" : ""}>开始扫描</button>
+        <button data-action="select-visible">全选</button>
+        <button data-action="unselect-visible">取消</button>
+        <button data-action="whitelist-selected" ${state.selected.size ? "" : "disabled"}>白名单</button>
+        <button class="danger command-button" data-action="execute" ${state.executing || !state.selected.size ? "disabled" : ""}>清理</button>
       </div>
+      <button class="command-trigger" data-action="open-command">命令 <kbd>Ctrl</kbd><kbd>K</kbd></button>
     </div>
+  `;
+}
+
+function renderTitlebar(env) {
+  const style = platformStyle(env?.platform || browserPlatform());
+  const controlOrder = style === "macos" ? ["close", "minimize", "maximize"] : ["minimize", "maximize", "close"];
+  const labels = {
+    close: "关闭",
+    minimize: "最小化",
+    maximize: "最大化"
+  };
+  const controls = `
+    <div class="window-controls ${style}" data-platform="${style}">
+      ${controlOrder
+        .map((action) => {
+          const disabled = action === "maximize" ? " disabled" : "";
+          const title = action === "maximize" ? "固定窗口大小" : labels[action];
+          return `<button class="window-control ${action}" data-window="${action}" title="${title}" aria-label="${labels[action]}"${disabled}><span></span></button>`;
+        })
+        .join("")}
+    </div>
+  `;
+  return `
+    <header class="titlebar">
+      ${style === "macos" ? controls : `<div></div>`}
+      <div class="titlebar-center" data-window-drag>
+        <span class="app-dot" data-window-drag></span>
+        <span data-window-drag>DCleaner</span>
+        <span class="titlebar-status ${env?.isAdmin ? "safe" : "warn"}" data-window-drag>${env?.isAdmin ? "管理员" : "普通权限"}</span>
+      </div>
+      ${style === "macos" ? `<div class="titlebar-spacer" data-window-drag></div>` : controls}
+    </header>
   `;
 }
 
@@ -421,7 +620,7 @@ function renderItems() {
 function renderTreeItems() {
   const grouped = treeGroups();
   if (!grouped.length) {
-    return `<div class="panel"><div class="empty">暂无扫描结果</div></div>`;
+    return `<div class="panel empty-panel"><div class="empty">暂无扫描结果</div></div>`;
   }
 
   return `
@@ -447,7 +646,7 @@ function renderModuleGroup(module) {
   return `
     <section class="tree-group">
       <div class="tree-row module-row">
-        <button class="twisty" data-expand="${module.id}" title="${expanded ? "收起" : "展开"}">${expanded ? "▾" : "▸"}</button>
+        <button class="twisty ${expanded ? "expanded" : ""}" data-expand="${module.id}" title="${expanded ? "收起" : "展开"}" aria-label="${expanded ? "收起" : "展开"}"></button>
         <input type="checkbox" data-select-group="${module.id}" ${moduleState.checked ? "checked" : ""} ${moduleState.partial ? "data-partial=\"true\"" : ""} />
         <strong class="tree-name module-name">${module.label}</strong>
         <span class="tree-count">${moduleState.checkedCount} / ${module.items.length}</span>
@@ -473,7 +672,7 @@ function renderCategoryGroup(moduleId, category) {
   return `
     <section class="tree-category">
       <div class="tree-row category-row">
-        <button class="twisty" data-expand="${category.key}" title="${expanded ? "收起" : "展开"}">${expanded ? "▾" : "▸"}</button>
+        <button class="twisty ${expanded ? "expanded" : ""}" data-expand="${category.key}" title="${expanded ? "收起" : "展开"}" aria-label="${expanded ? "收起" : "展开"}"></button>
         <input type="checkbox" data-select-group="${category.key}" ${categoryState.checked ? "checked" : ""} ${categoryState.partial ? "data-partial=\"true\"" : ""} />
         <strong class="tree-name category-name">${escapeHtml(category.category)}</strong>
         <span class="tree-count">${categoryState.checkedCount} / ${category.items.length}</span>
@@ -511,7 +710,7 @@ function renderTreeItem(moduleId, category, item) {
         </div>`
       : "";
   return `
-    <div class="tree-item">
+    <div class="tree-item" data-item-row="${item.id}">
       <div class="tree-row leaf-row">
         <span></span>
         <input type="checkbox" data-select="${item.id}" ${checked} />
@@ -525,10 +724,10 @@ function renderTreeItem(moduleId, category, item) {
         <span class="row-actions">
           ${
             item.children.length
-              ? `<button data-expand="${item.id}">${expanded ? "收起" : "展开"} ${item.children.length}</button>`
+              ? `<button class="subtle" data-expand="${item.id}">${expanded ? "收起" : "展开"} ${item.children.length}</button>`
               : ""
           }
-          <button data-whitelist-item="${item.id}">白名单</button>
+          <button class="subtle" data-whitelist-item="${item.id}">白名单</button>
         </span>
       </div>
       ${children}
@@ -538,7 +737,7 @@ function renderTreeItem(moduleId, category, item) {
 
 function renderBackups() {
   if (!state.backups.length) {
-    return `<div class="panel"><div class="empty">暂无注册表备份</div></div>`;
+    return `<div class="panel empty-panel"><div class="empty">暂无注册表备份</div></div>`;
   }
 
   return `
@@ -561,7 +760,7 @@ function renderBackups() {
 
 function renderWhitelistPage() {
   if (!state.itemWhitelist.length) {
-    return `<div class="panel"><div class="empty">暂无白名单项目</div></div>`;
+    return `<div class="panel empty-panel"><div class="empty">暂无白名单项目</div></div>`;
   }
 
   return `
@@ -581,6 +780,122 @@ function renderWhitelistPage() {
           `
         )
         .join("")}
+    </div>
+  `;
+}
+
+function commandItems() {
+  return [
+    {
+      id: "scan",
+      title: "开始扫描",
+      meta: "扫描系统、浏览器、应用和注册表",
+      action: "scan",
+      disabled: state.scanning
+    },
+    {
+      id: "execute",
+      title: "执行清理",
+      meta: `${state.selected.size} 项已选择`,
+      action: "execute",
+      disabled: state.executing || !state.selected.size
+    },
+    {
+      id: "select-visible",
+      title: "全选当前视图",
+      meta: `${visibleItems().length} 项可选`,
+      action: "select-visible",
+      disabled: !visibleItems().length
+    },
+    {
+      id: "unselect-visible",
+      title: "取消当前视图选择",
+      meta: "保留其他页面选择状态",
+      action: "unselect-visible",
+      disabled: !visibleItems().length
+    },
+    {
+      id: "whitelist-selected",
+      title: "加入白名单",
+      meta: "隐藏选中的项目",
+      action: "whitelist-selected",
+      disabled: !state.selected.size
+    },
+    {
+      id: "show-whitelist",
+      title: "打开白名单",
+      meta: `${state.itemWhitelist.length} 项`,
+      action: "show-whitelist"
+    },
+    {
+      id: "show-restore",
+      title: "打开恢复中心",
+      meta: `${state.backups.length} 个备份`,
+      action: "show-restore"
+    }
+  ];
+}
+
+function filteredCommandItems() {
+  const query = state.commandQuery.trim().toLocaleLowerCase("zh-Hans-CN");
+  const items = commandItems();
+  if (!query) return items;
+  return items.filter((item) =>
+    `${item.title} ${item.meta}`.toLocaleLowerCase("zh-Hans-CN").includes(query)
+  );
+}
+
+function renderCommandPalette() {
+  if (!state.commandOpen) return "";
+  return `
+    <div class="command-cover" data-action="close-command">
+      <section class="command-panel" role="dialog" aria-modal="true" aria-label="命令面板">
+        <input class="command-input" data-command-input placeholder="搜索命令" value="${escapeHtml(state.commandQuery)}" autocomplete="off" />
+        <div class="command-list">
+          ${renderCommandRows()}
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function renderCommandRows() {
+  const items = filteredCommandItems();
+  return items.length
+    ? items
+        .map(
+          (item, index) => `
+            <button class="command-row ${index === 0 ? "active" : ""}" data-command-action="${item.action}" ${item.disabled ? "disabled" : ""}>
+              <span>${escapeHtml(item.title)}</span>
+              <small>${escapeHtml(item.meta)}</small>
+            </button>`
+        )
+        .join("")
+    : `<div class="command-empty">没有匹配命令</div>`;
+}
+
+function renderContextMenu() {
+  if (!state.contextMenu) return "";
+  const item = itemById(state.contextMenu.itemId);
+  if (!item) return "";
+  const canExpand = item.children.length > 0;
+  const expanded = state.expanded.has(item.id);
+  const x = Math.min(state.contextMenu.x, window.innerWidth - 220);
+  const y = Math.min(state.contextMenu.y, window.innerHeight - 146);
+  return `
+    <div class="context-menu" style="left:${x}px; top:${y}px">
+      <button data-context-action="toggle-select" data-context-item="${item.id}">
+        <span>${state.selected.has(item.id) ? "取消选择" : "选择项目"}</span>
+        <kbd>Space</kbd>
+      </button>
+      <button data-context-action="whitelist" data-context-item="${item.id}">
+        <span>加入白名单</span>
+        <kbd>W</kbd>
+      </button>
+      <button data-context-action="expand" data-context-item="${item.id}" ${canExpand ? "" : "disabled"}>
+        <span>${expanded ? "收起明细" : "展开明细"}</span>
+        <kbd>Enter</kbd>
+      </button>
     </div>
   `;
 }
@@ -660,45 +975,58 @@ function render(options = {}) {
   const env = state.env;
   const isRestore = state.activeModule === "restore";
   const isWhitelist = state.activeModule === "whitelist";
+  const module = currentModule();
   app.innerHTML = `
-    <div class="shell">
-      <aside class="sidebar">
-        <div class="brand">
-          <div class="brand-mark">D</div>
-          <h1>DCleaner</h1>
-        </div>
-        <nav class="nav">${renderNav()}</nav>
-        <div class="sidebar-footer">
-          <div>注册表清理会先生成 .reg 备份。</div>
-        </div>
-      </aside>
-      <main class="main">
-        <div class="topbar">
-          <div class="title">
-            <h2>${isRestore ? "恢复中心" : isWhitelist ? "白名单" : "扫描与清理"}</h2>
-            <p>${
-              isRestore
-                ? "查看并导入历史注册表备份。"
-                : isWhitelist
-                  ? "这些项目会从扫描结果中隐藏，执行清理时自动跳过。"
-                  : `当前预计释放 ${formatBytes(data.selectedSize)}。`
-            }</p>
+    <div class="window-shell">
+      ${renderTitlebar(env)}
+      <div class="shell">
+        <aside class="sidebar">
+          <div class="brand">
+            <div class="brand-mark">D</div>
+            <div>
+              <h1>DCleaner</h1>
+              <span>Desktop Cleaner</span>
+            </div>
           </div>
-          <div class="status-row">
-            <span class="badge ${env?.isAdmin ? "safe" : "warn"}">${env?.isAdmin ? "管理员权限" : "普通权限"}</span>
-            ${env && !env.isAdmin ? `<button data-action="admin">以管理员身份重启</button>` : ""}
+          <nav class="nav">${renderNav()}</nav>
+          <div class="sidebar-footer">
+            <span>备份目录</span>
+            <strong title="${escapeHtml(env?.backupDir || "")}">${escapeHtml(env?.backupDir || "加载中")}</strong>
           </div>
-        </div>
-        ${isRestore || isWhitelist ? "" : renderSummary()}
-        ${renderToolbar()}
-        ${isRestore ? renderBackups() : isWhitelist ? renderWhitelistPage() : renderItems()}
-        ${renderWarnings()}
-      </main>
+        </aside>
+        <main class="main">
+          <div class="topbar">
+            <div class="title">
+              <span class="section-icon">${module.icon}</span>
+              <div>
+                <h2>${isRestore ? "恢复中心" : isWhitelist ? "白名单" : "扫描与清理"}</h2>
+                <p>${
+                  isRestore
+                    ? "查看并导入历史注册表备份。"
+                    : isWhitelist
+                      ? "这些项目会从扫描结果中隐藏，执行清理时自动跳过。"
+                      : `当前预计释放 ${formatBytes(data.selectedSize)}。`
+                }</p>
+              </div>
+            </div>
+            <div class="status-row">
+              ${env && !env.isAdmin ? `<button data-action="admin">以管理员身份重启</button>` : ""}
+            </div>
+          </div>
+          ${isRestore || isWhitelist ? "" : renderSummary()}
+          ${renderToolbar()}
+          ${isRestore ? renderBackups() : isWhitelist ? renderWhitelistPage() : renderItems()}
+          ${renderWarnings()}
+        </main>
+      </div>
     </div>
     ${renderModal()}
+    ${renderCommandPalette()}
+    ${renderContextMenu()}
     ${state.toast ? `<div class="toast">${escapeHtml(state.toast)}</div>` : ""}
   `;
   syncPartialCheckboxes();
+  if (state.commandOpen) app.querySelector("[data-command-input]")?.focus();
   if (options.preserveScroll) {
     const main = app.querySelector(".main");
     if (main) {
@@ -709,6 +1037,18 @@ function render(options = {}) {
 }
 
 app.addEventListener("click", async (event) => {
+  const commandPanel = event.target.closest(".command-panel");
+  if (state.commandOpen && !commandPanel && event.target.dataset.action === "close-command") {
+    await runAction("close-command");
+    return;
+  }
+
+  if (state.contextMenu && !event.target.closest(".context-menu")) {
+    state.contextMenu = null;
+    render({ preserveScroll: true });
+    return;
+  }
+
   const target = event.target.closest("button");
   const checkbox = event.target.closest("input[type='checkbox']");
 
@@ -737,8 +1077,39 @@ app.addEventListener("click", async (event) => {
 
   if (!target) return;
 
+  const windowAction = target.dataset.window;
+  if (windowAction === "minimize") {
+    await appWindow?.minimize();
+    return;
+  }
+  if (windowAction === "close") {
+    await appWindow?.close();
+    return;
+  }
+
+  const contextAction = target.dataset.contextAction;
+  if (contextAction) {
+    const itemId = target.dataset.contextItem;
+    if (contextAction === "toggle-select") {
+      if (state.selected.has(itemId)) state.selected.delete(itemId);
+      else state.selected.add(itemId);
+      state.contextMenu = null;
+      render({ preserveScroll: true });
+    }
+    if (contextAction === "whitelist") await runAction("whitelist-item", { itemId });
+    if (contextAction === "expand") await runAction("toggle-item", { itemId });
+    return;
+  }
+
+  const commandAction = target.dataset.commandAction;
+  if (commandAction) {
+    await runAction(commandAction);
+    return;
+  }
+
   const nav = target.dataset.nav;
   if (nav) {
+    closeOverlays();
     state.activeModule = nav;
     state.page = 1;
     if (nav === "restore") await loadBackups();
@@ -774,21 +1145,7 @@ app.addEventListener("click", async (event) => {
   }
 
   const action = target.dataset.action;
-  if (action === "scan") await runScan();
-  if (action === "execute") await executeSelected();
-  if (action === "whitelist-selected") addItemsToWhitelist(selectedItems());
-  if (action === "clear-whitelist") {
-    if (window.confirm("确认清空白名单？")) {
-      state.itemWhitelist = [];
-      saveWhitelist();
-      showToast("白名单已清空，重新扫描后恢复显示。");
-      render({ preserveScroll: true });
-    }
-  }
-  if (action === "select-visible") toggleAllVisible(true);
-  if (action === "unselect-visible") toggleAllVisible(false);
-  if (action === "reload-backups") await loadBackups();
-  if (action === "admin") await relaunchAdmin();
+  if (action) await runAction(action);
   if (action === "kill-conflicts") {
     const decisions = Object.fromEntries(state.conflicts.map((item) => [item.itemId, "kill"]));
     await executeSelected(decisions);
@@ -799,10 +1156,56 @@ app.addEventListener("click", async (event) => {
   }
 });
 
-listen("clean-progress", (event) => {
-  state.progress = event.payload;
-  render({ preserveScroll: true });
+app.addEventListener("input", (event) => {
+  if (event.target.matches("[data-command-input]")) {
+    state.commandQuery = event.target.value;
+    const list = app.querySelector(".command-list");
+    if (list) list.innerHTML = renderCommandRows();
+  }
 });
+
+app.addEventListener("keydown", async (event) => {
+  if (!state.commandOpen) return;
+  if (event.key === "Enter") {
+    const first = filteredCommandItems().find((item) => !item.disabled);
+    if (first) await runAction(first.action);
+    return;
+  }
+  if (event.key === "Escape") {
+    await runAction("close-command");
+  }
+});
+
+document.addEventListener("keydown", async (event) => {
+  const activeTag = document.activeElement?.tagName?.toLowerCase();
+  const isTextInput = ["input", "textarea"].includes(activeTag);
+  if ((event.ctrlKey || event.metaKey) && ["+", "-", "=", "0"].includes(event.key)) {
+    event.preventDefault();
+  }
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+    event.preventDefault();
+    await runAction("toggle-command");
+  }
+  if (event.key === "Escape") {
+    if (state.contextMenu) {
+      state.contextMenu = null;
+      render({ preserveScroll: true });
+      return;
+    }
+    if (state.commandOpen) await runAction("close-command");
+  }
+  if (!isTextInput && event.key.toLowerCase() === "f5") {
+    event.preventDefault();
+    await runAction("scan");
+  }
+});
+
+if (inTauri) {
+  listen("clean-progress", (event) => {
+    state.progress = event.payload;
+    render({ preserveScroll: true });
+  });
+}
 
 function syncPartialCheckboxes() {
   app.querySelectorAll("input[data-partial='true']").forEach((input) => {

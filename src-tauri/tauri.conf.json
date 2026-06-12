@@ -20,7 +20,11 @@
         "maxWidth": 1180,
         "maxHeight": 760,
         "resizable": false,
-        "maximizable": false
+        "maximizable": false,
+        "center": true,
+        "decorations": false,
+        "transparent": false,
+        "shadow": false
       }
     ],
     "security": {
